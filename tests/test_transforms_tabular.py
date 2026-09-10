@@ -153,6 +153,54 @@ def test_parse_markdown_table_drops_separator() -> None:
     assert all("---" not in cell for row in rows for cell in row)
 
 
+def test_parse_tabular_rejects_ragged_fixed_width(monkeypatch) -> None:
+    # Rows with differing cell counts can't be zipped under the headers
+    # without misattributing columns (#1652) — must pass through.
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "fixed_width"}),
+    )
+    ragged = (
+        "tool  installed  latest  status\n"
+        "rtk  0.42.4  0.43.0  update available\n"
+        "rtk  ✓  0.42.4  0.42.4  -  up-to-date"
+    )
+    assert ti.parse_tabular(ragged) is None
+
+
+def test_parse_tabular_rejects_ragged_markdown(monkeypatch) -> None:
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "markdown"}),
+    )
+    ragged = "| a | b | c |\n| --- | --- | --- |\n| 1 | 2 | 3 |\n| 4 | 5 |"
+    assert ti.parse_tabular(ragged) is None
+
+
+def test_compress_passes_through_ragged_table(monkeypatch) -> None:
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "fixed_width"}),
+    )
+    ragged = (
+        "tool  installed  latest  status\n"
+        "rtk  0.42.4  0.43.0  update available\n"
+        "rtk  ✓  0.42.4  0.42.4  -  up-to-date"
+    )
+    result = TabularCompressor().compress(ragged)
+    assert not result.was_modified
+    assert result.compressed == ragged
+
+
 def test_parse_tabular_returns_none_for_non_tabular() -> None:
     assert parse_tabular("just a normal paragraph here") is None
 
@@ -272,6 +320,29 @@ def test_router_respects_disable_flag() -> None:
 
 
 # Binary spreadsheet ingestion -----------------------------------------------
+
+
+def test_rows_to_csv_drops_trailing_empty_rows_and_has_no_dangling_cr() -> None:
+    """Trailing all-empty rows are dropped and the output has no stray ``\\r``.
+
+    openpyxl's used-range routinely extends past the last data row, so a sheet
+    commonly ends in ``(None, None, ...)`` tuples. Those were emitted as blank
+    ``,`` rows, and ``csv.writer``'s default ``\\r\\n`` terminator combined with
+    ``.strip("\\n")`` left a dangling ``\\r`` — noise fed straight to the LLM.
+    """
+    from headroom.transforms.spreadsheet_ingest import _rows_to_csv
+
+    rendered = _rows_to_csv(
+        [["Name", "Age"], ["Alice", "30"], [None, None], ["", "  "], [None, None]]
+    )
+    assert rendered == "Name,Age\nAlice,30"
+    assert "\r" not in rendered
+
+    # Interior empty rows are preserved (only the trailing run is dropped).
+    assert _rows_to_csv([["a", "b"], [None, None], ["c", "d"], [None, None]]) == "a,b\n,\nc,d"
+
+    # A fully empty sheet renders to the empty string.
+    assert _rows_to_csv([[None, None], ["", ""]]) == ""
 
 
 @pytest.mark.skipif(not _HAS_OPENPYXL, reason="openpyxl not installed")

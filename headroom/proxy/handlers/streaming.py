@@ -7,13 +7,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
-from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import jitter_delay_ms
+from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalescing
+from headroom.proxy.helpers import (
+    RETRYABLE_OVERLOAD_STATUSES,
+    jitter_delay_ms,
+    retry_after_ms,
+)
+from headroom.proxy.token_counting import gemini_output_tokens
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -22,8 +29,127 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
+from headroom.proxy.stream_output_tokens import estimate_output_tokens
+from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 
 logger = logging.getLogger("headroom.proxy")
+
+_ANTHROPIC_LIMIT_STATUSES = frozenset({401, 402, 429})
+_ANTHROPIC_ISO_RESET_RE = re.compile(
+    r"wait until (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+    re.IGNORECASE,
+)
+_ANTHROPIC_NAMED_RESET_RE = re.compile(
+    r"will reset on\s+([A-Za-z]+)\s+(\d{1,2})\s+at\s+"
+    r"(\d{1,2}):(\d{2})\s+(AM|PM)\s*\(UTC([+-]?\d{1,2})\)",
+    re.IGNORECASE,
+)
+_MONTHS = {
+    name: number
+    for number, name in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
+
+
+def _anthropic_limit_reset(
+    status_code: int,
+    error_content: bytes,
+    *,
+    now: dt.datetime | None = None,
+) -> tuple[float, str] | None:
+    """Return a future Anthropic usage-limit reset as ``(seconds, display)``.
+
+    Besides Anthropic's nested 429 payload, some compatible gateways use
+    401/402, a string-valued ``error``, and a named date with a UTC offset.
+    Authentication/billing failures are not retried unless their message also
+    carries both an explicit rate-limit signal and a supported reset phrase.
+    """
+    if status_code not in _ANTHROPIC_LIMIT_STATUSES:
+        return None
+    try:
+        payload = json.loads(error_content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message", "")
+    elif isinstance(error, str):
+        message = error
+    else:
+        message = payload.get("message", "")
+    if not isinstance(message, str):
+        return None
+    lowered = message.lower()
+    if not ("usage limit reached" in lowered or "rate limit" in lowered):
+        return None
+
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    current = current.astimezone(dt.timezone.utc)
+
+    iso_match = _ANTHROPIC_ISO_RESET_RE.search(message)
+    if iso_match:
+        display = iso_match.group(1)
+        normalized = display[:-1] + "+00:00" if display.endswith(("Z", "z")) else display
+        try:
+            reset = dt.datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if reset.tzinfo is None:
+            reset = reset.replace(tzinfo=dt.timezone.utc)
+    else:
+        named_match = _ANTHROPIC_NAMED_RESET_RE.search(message)
+        if named_match is None:
+            return None
+        month_name, day, hour, minute, meridiem, offset = named_match.groups()
+        month = _MONTHS.get(month_name[:3].lower())
+        offset_hours = int(offset)
+        if month is None or not -23 <= offset_hours <= 23:
+            return None
+        hour_value = int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0)
+        try:
+            reset = dt.datetime(
+                current.year,
+                month,
+                int(day),
+                hour_value,
+                int(minute),
+                tzinfo=dt.timezone(dt.timedelta(hours=offset_hours)),
+            )
+        except ValueError:
+            return None
+        if reset.astimezone(dt.timezone.utc) < current - dt.timedelta(days=30):
+            try:
+                reset = reset.replace(year=current.year + 1)
+            except ValueError:
+                return None
+        display = reset.isoformat()
+
+    seconds = (reset.astimezone(dt.timezone.utc) - current).total_seconds()
+    return (seconds, display) if seconds > 0 else None
+
+
+def _thinking_for_stream(payload: object) -> ThinkingTokens:
+    """Thinking-token split for a reassembled streaming response.
+
+    Shares the estimator with the non-streaming path so a streamed and an
+    unstreamed response of the same shape produce the same number — otherwise
+    the stratum would mix two different rulers.
+
+    Never raises: accounting must not cost a caller their response.
+    """
+    try:
+        from headroom.proxy.handlers.anthropic import _thinking_estimator
+
+        return extract_thinking_tokens(payload, estimator=_thinking_estimator())
+    except Exception:  # noqa: BLE001 - accounting must never break a response
+        return ThinkingTokens()
 
 
 def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
@@ -58,6 +184,77 @@ def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
 
 class StreamingMixin:
     """Mixin providing streaming response methods for HeadroomProxy."""
+
+    _mid_turn_queues: dict[str, asyncio.Queue] = {}
+    _active_streams: set[str] = set()
+
+    @staticmethod
+    def _get_session_key(body: dict, session_header: str | None = None) -> str:
+        """Return session identity from an explicit header or a body-derived hash.
+
+        The fallback is a coarse, self-contained hash (md5 of
+        ``model:system[:500]``) used ONLY to key the mid-turn steering state
+        below. It is NOT the same derivation as
+        ``prefix_tracker.compute_session_id`` (which json-encodes the full
+        leading system-text run) — do not key cross-subsystem state on the
+        assumption that the two fallbacks agree.
+        """
+        if session_header:
+            return session_header
+        import hashlib
+
+        system = body.get("system", "")
+        if isinstance(system, list):
+            for block in system:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    system = block.get("text", "")
+                    break
+            else:
+                system = ""
+        system_content = str(system)[:500]
+        key = f"{body.get('model', '')}:{system_content}"
+        return hashlib.md5(key.encode()).hexdigest()[:16]
+
+    def _queue_mid_turn_message(self, session_key: str, body: dict) -> dict:
+        """Queue a mid-turn message and return a 202 response."""
+        if session_key not in self._mid_turn_queues:
+            self._mid_turn_queues[session_key] = asyncio.Queue()
+        self._mid_turn_queues[session_key].put_nowait(body)
+        return {"status": 202, "event": "headroom_queued"}
+
+    def _should_queue_mid_turn(self, session_key: str, explicit_session_header: str | None) -> bool:
+        """Return True only when a follow-up should be queued as a mid-turn message.
+
+        Mid-turn steering is a private Headroom protocol: a queued message is
+        only ever drained back to the client via the custom
+        ``headroom_pending_messages`` SSE event, which a standard Anthropic SDK
+        does not understand. We therefore only engage it for clients that
+        *opt in* by sending an explicit ``x-headroom-session-id`` header.
+
+        Without that header the session identity falls back to
+        ``md5(model + system[:500])`` (see ``_get_session_key`` /
+        ``prefix_tracker.compute_session_id``). That fallback is intentionally
+        coarse and cannot distinguish genuinely concurrent, independent streams
+        that happen to share a model + system prompt (e.g. a main conversation
+        plus its background/parallel requests). Queuing those as mid-turn
+        messages wrongly returns a 202 + JSON body to a caller that issued a
+        *streaming* request, whose stream parser then sees an empty (non-SSE)
+        stream and fails. So only opt-in (header-bearing) callers get queued.
+        """
+        return bool(explicit_session_header) and session_key in self._active_streams
+
+    def _cleanup_mid_turn_stream(
+        self, session_key: str, *, drain_pending_messages: bool = False
+    ) -> list[dict]:
+        """Clear active mid-turn state, optionally returning queued messages."""
+        self._active_streams.discard(session_key)
+        queue = self._mid_turn_queues.pop(session_key, None)
+        if not drain_pending_messages or queue is None or queue.empty():
+            return []
+        pending_messages: list[dict] = []
+        while not queue.empty():
+            pending_messages.append(queue.get_nowait())
+        return pending_messages
 
     @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
@@ -149,7 +346,7 @@ class StreamingMixin:
                     usage_meta = data.get("usageMetadata")
                     if usage_meta:
                         usage["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                        usage["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
+                        usage["output_tokens"] = gemini_output_tokens(usage_meta)
                         # Gemini also has cachedContentTokenCount for context caching
                         usage["cache_read_input_tokens"] = usage_meta.get(
                             "cachedContentTokenCount", 0
@@ -267,14 +464,20 @@ class StreamingMixin:
                 usage_meta = data.get("usageMetadata")
                 if usage_meta:
                     usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                    usage_found["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
+                    usage_found["output_tokens"] = gemini_output_tokens(usage_meta)
                     usage_found["cache_read_input_tokens"] = usage_meta.get(
                         "cachedContentTokenCount", 0
                     )
 
         return usage_found if usage_found else None
 
-    def _parse_sse_to_response(self, sse_data: str, provider: str) -> dict[str, Any] | None:
+    def _parse_sse_to_response(
+        self,
+        sse_data: str,
+        provider: str,
+        *,
+        require_complete: bool = False,
+    ) -> dict[str, Any] | None:
         """Parse SSE data to reconstruct the API response JSON.
 
         Args:
@@ -282,6 +485,10 @@ class StreamingMixin:
                 from a complete-events bytes buffer (see
                 ``parse_sse_events_from_byte_buffer``).
             provider: Provider type for parsing.
+            require_complete: Reject anything short of a whole, replayable
+                message — see the strictness note below. Off by default so
+                streaming callers keep the lenient reconstruction they were
+                written against.
 
         Returns:
             Reconstructed response dict or None if parsing fails.
@@ -290,22 +497,56 @@ class StreamingMixin:
         ``text_delta``, ``input_json_delta``, ``thinking_delta``,
         ``signature_delta``, ``citations_delta``. Also preserves
         ``redacted_thinking.data`` and accumulates citations as a list.
+
+        Permissive mode answers with whatever blocks it managed to
+        accumulate. That is right for a streaming caller salvaging a
+        partial stream, and wrong for #3130, where the reconstruction is
+        handed to the client *as* the turn: a truncated stream would become
+        a successful — and silently short — message, and an ``error`` event
+        would vanish behind an HTTP 200. ``require_complete`` demands
+        ``message_start``, a terminal ``message_stop``, every opened block
+        closed, no ``error`` event, and no delta type this reconstructor
+        cannot replay; anything else returns None so the caller can fail
+        loudly instead.
         """
         if provider != "anthropic":
             return None  # Only implemented for Anthropic
 
+        # Event framing is CRLF in some intermediaries (and mixed after a
+        # retry through one). Normalize before the line split so a
+        # correctly framed stream is never read as zero events.
+        sse_data = sse_data.replace("\r\n", "\n").replace("\r", "\n")
+
         response: dict[str, Any] = {"content": [], "usage": {}}
+        saw_message_start = False
+        saw_message_stop = False
+        saw_error = False
+        saw_unreplayable_delta = False
+        open_block_indices: set[int] = set()
         # Track blocks by their `index` field so out-of-order events
         # don't corrupt the reconstruction. The current block pointer
         # remains for backward-compat with code that walks this dict
         # sequentially, but the index map is the source of truth.
         blocks_by_index: dict[int, dict[str, Any]] = {}
         current_block: dict[str, Any] | None = None
+        # Track which block indices have already been appended to
+        # `response["content"]`. Dedup used to be `target not in
+        # response["content"]` — plain dict-equality. Two distinct blocks
+        # that happen to accumulate identical values (most commonly two
+        # separate empty `thinking` blocks, e.g. from a retried HTTP/2
+        # stream reset redelivering a truncated segment) either got
+        # wrongly collapsed into one, or — when their partial content
+        # happened to differ (same index, unequal dict) — both slipped
+        # through as duplicates. Indexing by `index` (falling back to
+        # object identity for the legacy no-index path) makes dedup exact
+        # regardless of what the accumulated content looks like: one
+        # entry per block index, first `content_block_stop` wins.
+        appended_block_keys: set[int] = set()
 
         for line in sse_data.split("\n"):
-            if not line.startswith("data: "):
+            if not line.startswith("data:"):
                 continue
-            data_str = line[6:].strip()
+            data_str = line[5:].strip()
             if not data_str or data_str == "[DONE]":
                 continue
 
@@ -317,11 +558,17 @@ class StreamingMixin:
             event_type = data.get("type", "")
 
             if event_type == "message_start":
+                saw_message_start = True
                 msg = data.get("message", {})
                 response["id"] = msg.get("id")
+                response["type"] = msg.get("type", "message")
+                if "stop_sequence" in msg:
+                    response["stop_sequence"] = msg["stop_sequence"]
                 response["model"] = msg.get("model")
                 response["role"] = msg.get("role", "assistant")
                 response["stop_reason"] = msg.get("stop_reason")
+                if "stop_details" in msg:
+                    response["stop_details"] = msg["stop_details"]
                 if msg.get("usage"):
                     response["usage"].update(msg["usage"])
 
@@ -353,7 +600,17 @@ class StreamingMixin:
                     # signature validation to pass.
                     if "data" in block:
                         current_block["data"] = block["data"]
+                elif btype:
+                    # Non-standard block (server_tool_use, web_search_tool_result,
+                    # ...): copy through all of the block's fields so the
+                    # reconstruction doesn't silently drop them to a bare
+                    # {type, index}. Mirrors the sibling reconstructor
+                    # `_reconstruct_anthropic_response`, which does `dict(block)`.
+                    for _k, _v in block.items():
+                        if _k != "type":
+                            current_block[_k] = _v
                 blocks_by_index[block_index] = current_block
+                open_block_indices.add(block_index)
 
             elif event_type == "content_block_delta":
                 # Resolve the target block by index (preferred) or fall
@@ -390,37 +647,84 @@ class StreamingMixin:
                         citation = delta.get("citation")
                         if citation is not None:
                             citations.append(citation)
+                    else:
+                        # A delta this reconstructor has no rule for: the
+                        # accumulated block is missing whatever it carried.
+                        saw_unreplayable_delta = True
 
             elif event_type == "content_block_stop":
                 idx = data.get("index")
                 target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
                 if target is not None:
-                    # Parse accumulated JSON for tool_use blocks.
-                    if target.get("type") == "tool_use" and "_partial_json" in target:
+                    # Parse accumulated JSON into `input` for any block that
+                    # streamed `input_json_delta` — tool_use AND server_tool_use
+                    # (and future tool-ish blocks). Gating on the block type
+                    # missed server_tool_use, leaving its `input` at the empty
+                    # start-event value and leaking the `_partial_json` scratch
+                    # key into replayed assistant history, which Anthropic then
+                    # rejects with `server_tool_use.input: Input should be an
+                    # object` (#2438). Always strip the scratch key.
+                    if "_partial_json" in target:
+                        raw = target.pop("_partial_json")
                         try:
-                            target["input"] = json.loads(target["_partial_json"])
+                            target["input"] = json.loads(raw) if raw else {}
                         except json.JSONDecodeError:
                             target["input"] = {}
-                        del target["_partial_json"]
                     # Materialize the thinking buffer into the
                     # canonical `thinking` field expected by the
                     # Anthropic API.
                     if target.get("type") == "thinking" and "thinking_buffer" in target:
                         target["thinking"] = target.pop("thinking_buffer")
-                    # Append the block exactly once. `current_block`
-                    # may not match the indexed target if the stream
-                    # interleaved multiple blocks; index-keyed map is
-                    # authoritative.
-                    if target not in response["content"]:
+                    # Append the block exactly once, keyed by its block
+                    # index (or object identity when no index was ever
+                    # assigned). `current_block` may not match the
+                    # indexed target if the stream interleaved multiple
+                    # blocks; index-keyed map is authoritative.
+                    block_key = idx if idx is not None else id(target)
+                    if block_key not in appended_block_keys:
                         response["content"].append(target)
+                        appended_block_keys.add(block_key)
+                    if idx is not None:
+                        open_block_indices.discard(idx)
                     current_block = None
 
             elif event_type == "message_delta":
                 delta = data.get("delta", {})
-                if delta.get("stop_reason"):
+                if "stop_reason" in delta:
                     response["stop_reason"] = delta["stop_reason"]
+                if "stop_details" in delta:
+                    response["stop_details"] = delta["stop_details"]
+                if "stop_sequence" in delta:
+                    response["stop_sequence"] = delta["stop_sequence"]
                 if data.get("usage"):
                     response["usage"].update(data["usage"])
+
+            elif event_type == "message_stop":
+                saw_message_stop = True
+
+            elif event_type == "error":
+                # An in-band failure. Permissive callers keep salvaging
+                # what arrived before it; a strict caller must not dress
+                # the remains up as a successful turn.
+                saw_error = True
+
+        if require_complete:
+            if (
+                not saw_message_start
+                or not saw_message_stop
+                or saw_error
+                or saw_unreplayable_delta
+                or open_block_indices
+            ):
+                return None
+            # ``index`` is a response-delta field. Anthropic rejects it on
+            # the next request ("content.0.text.index: Extra inputs are not
+            # permitted"), so it must not survive into a body the client
+            # will persist and echo back.
+            for block in response["content"]:
+                if isinstance(block, dict):
+                    block.pop("index", None)
+            return response
 
         return response if response.get("content") else None
 
@@ -454,8 +758,17 @@ class StreamingMixin:
         }
         events.append(f"event: message_start\ndata: {json.dumps(msg_start)}\n\n".encode())
 
-        # Content blocks
-        for idx, block in enumerate(response.get("content", [])):
+        # Content blocks. `content` is provider/reconstruction-controlled, so a
+        # present-but-null value or a non-list would crash `enumerate`, and a
+        # non-dict element would crash `block.get(...)`. Guard both, matching the
+        # sibling `_record_ccr_feedback_from_response` below. This is reached from
+        # a call site (anthropic.py buffered CCR path) that only catches
+        # ValueError, so an unguarded TypeError/AttributeError would 500 the
+        # streamed request.
+        content = response.get("content")
+        for idx, block in enumerate(content if isinstance(content, list) else []):
+            if not isinstance(block, dict):
+                continue
             # content_block_start
             if block.get("type") == "text":
                 block_start = {
@@ -474,8 +787,39 @@ class StreamingMixin:
                         "input": {},
                     },
                 }
+            elif block.get("type") == "thinking":
+                content_block = {
+                    "type": "thinking",
+                    "thinking": "",
+                }
+                if "signature" in block:
+                    content_block["signature"] = block["signature"]
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": content_block,
+                }
+            elif block.get("type") == "redacted_thinking":
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "redacted_thinking",
+                        "data": block.get("data", ""),
+                    },
+                }
+            elif block.get("type") == "server_tool_use":
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": block,
+                }
             else:
-                continue
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": block,
+                }
 
             events.append(
                 f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
@@ -489,6 +833,15 @@ class StreamingMixin:
                     "delta": {"type": "text_delta", "text": block["text"]},
                 }
                 events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+                for citation in block.get("citations", []) or []:
+                    citation_delta = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "citations_delta", "citation": citation},
+                    }
+                    events.append(
+                        f"event: content_block_delta\ndata: {json.dumps(citation_delta)}\n\n".encode()
+                    )
             elif block.get("type") == "tool_use" and block.get("input"):
                 delta = {
                     "type": "content_block_delta",
@@ -499,16 +852,43 @@ class StreamingMixin:
                     },
                 }
                 events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+            elif block.get("type") == "thinking":
+                if block.get("thinking"):
+                    delta = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "thinking_delta", "thinking": block["thinking"]},
+                    }
+                    events.append(
+                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
+                    )
+                if block.get("signature"):
+                    delta = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "signature_delta", "signature": block["signature"]},
+                    }
+                    events.append(
+                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
+                    )
 
             # content_block_stop
             block_stop = {"type": "content_block_stop", "index": idx}
             events.append(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
 
         # message_delta
+        msg_delta_payload: dict[str, Any] = {}
+        if "stop_reason" in response:
+            msg_delta_payload["stop_reason"] = response["stop_reason"]
+        if "stop_details" in response:
+            msg_delta_payload["stop_details"] = response["stop_details"]
+        usage = response.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
         msg_delta = {
             "type": "message_delta",
-            "delta": {"stop_reason": response.get("stop_reason", "end_turn")},
-            "usage": {"output_tokens": response.get("usage", {}).get("output_tokens", 0)},
+            "delta": msg_delta_payload,
+            "usage": {"output_tokens": usage.get("output_tokens", 0)},
         }
         events.append(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
 
@@ -543,24 +923,17 @@ class StreamingMixin:
 
             input_data = block.get("input", {})
             hash_key = input_data.get("hash")
-            query = input_data.get("query")
 
             if not hash_key:
                 continue
 
-            logger.info(
-                f"[{request_id}] CCR Feedback: Recording retrieval "
-                f"hash={hash_key[:8]}... query={query!r}"
-            )
+            logger.info(f"[{request_id}] CCR Feedback: Recording retrieval hash={hash_key[:8]}...")
 
-            # Call store.retrieve()/search() for the side effect of triggering
-            # the feedback chain: _log_retrieval -> process_pending_feedback
+            # Call store.retrieve() for the side effect of triggering the
+            # feedback chain: _log_retrieval -> process_pending_feedback
             # -> toin.record_retrieval(). We discard the returned content.
             try:
-                if query:
-                    store.search(hash_key, query)
-                else:
-                    store.retrieve(hash_key, query=None)
+                store.retrieve(hash_key)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback recording failed: {e}")
 
@@ -625,19 +998,15 @@ class StreamingMixin:
             if not isinstance(input_data, dict):
                 continue
             hash_key = input_data.get("hash")
-            query = input_data.get("query")
             if not hash_key:
                 continue
 
             logger.info(
                 f"[{request_id}] CCR Feedback (openai stream): Recording retrieval "
-                f"hash={hash_key[:8]}... query={query!r}"
+                f"hash={hash_key[:8]}..."
             )
             try:
-                if query:
-                    store.search(hash_key, query)
-                else:
-                    store.retrieve(hash_key, query=None)
+                store.retrieve(hash_key)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback (openai stream) failed: {e}")
 
@@ -664,6 +1033,13 @@ class StreamingMixin:
         parsed_response: dict[str, Any] | None = None,
         client: str | None = None,
         waste_signals: dict[str, int] | None = None,
+        status_code: int = 200,
+        # Set only by paths whose ``tokens_saved`` is the CONVERSATION's
+        # running total rather than this turn's -- OpenAI ``/v1/responses``,
+        # which re-sends and recompresses the whole transcript every turn.
+        # See ``conversation_savings``.
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
     ) -> None:
         from headroom.proxy.outcome import RequestOutcome
 
@@ -702,12 +1078,33 @@ class StreamingMixin:
                     stream_state[key] = late_usage[key]
 
         output_tokens = stream_state["output_tokens"]
+        output_tokens_source = "provider"
         if output_tokens is None:
-            output_tokens = stream_state["total_bytes"] // 40
-            logger.warning(
-                f"[{request_id}] Could not parse output_tokens from SSE, "
-                f"estimating {output_tokens} from {stream_state['total_bytes']} bytes"
+            # No usage chunk from the upstream. Count the stream's OWN TEXT
+            # rather than dividing the raw wire by a constant: `total_bytes`
+            # includes every `data:` prefix, JSON envelope and framing newline,
+            # so its error tracked how chattily the answer was chunked instead
+            # of how long the answer was. Falls back to the byte heuristic only
+            # when no text could be recovered at all.
+            output_tokens, output_tokens_source = estimate_output_tokens(
+                sse_text=full_sse_data,
+                total_bytes=stream_state["total_bytes"],
             )
+            # Name the actual basis. The old message always said "from N bytes"
+            # even though that is now only true for the fallback rung, and an
+            # operator reading it needs to know which estimate they are looking
+            # at before trusting the number.
+            basis = (
+                "counted from stream text"
+                if output_tokens_source == "estimated_text"
+                else f"estimated from {stream_state['total_bytes']} raw SSE bytes"
+            )
+            logger.warning(
+                f"[{request_id}] No usage chunk in SSE; output_tokens={output_tokens} ({basis})"
+            )
+
+        outcome_tags = dict(tags or {})
+        outcome_tags["output_tokens_source"] = output_tokens_source
 
         provider_input_tokens = stream_state.get("input_tokens")
         effective_optimized_tokens = optimized_tokens
@@ -731,7 +1128,7 @@ class StreamingMixin:
         # Prefix-tracker mutation is provider-specific state that lives
         # outside the metric funnel. Run it before the funnel so the next
         # request inherits correct prefix state regardless of metric path.
-        if prefix_tracker is not None:
+        if 200 <= status_code < 300 and prefix_tracker is not None:
             import copy as _copy
 
             forwarded_messages = body.get("messages", [])
@@ -750,6 +1147,27 @@ class StreamingMixin:
                         next_forwarded.append(_copy.deepcopy(asst_msg))
                         next_original.append(_copy.deepcopy(asst_msg))
 
+            # Cache-miss attribution (#1313), streaming Anthropic path. Mirror
+            # the non-streaming handler: classify BEFORE update_from_response
+            # overwrites the last-turn state the classifier reads. Compare the
+            # prefix we forwarded this turn (`forwarded_messages`, pre-assistant
+            # append) against last turn's.
+            # `hasattr` guard: stub trackers in tests may implement only the
+            # freeze API, not the full PrefixCacheTracker surface.
+            if provider == "anthropic" and hasattr(prefix_tracker, "classify_cache_miss"):
+                miss = prefix_tracker.classify_cache_miss(
+                    cache_read_tokens=cache_read_tokens,
+                    current_forwarded_messages=forwarded_messages,
+                )
+                if miss.is_miss:
+                    logger.info(
+                        f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
+                        f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
+                        f"expected_cached={miss.expected_cached_tokens:,} "
+                        f"prefix_changed={miss.prefix_changed} ttl_exceeded={miss.ttl_exceeded}"
+                    )
+                    await self.metrics.record_cache_miss_attribution(provider, miss.reason)
+
             prefix_tracker.update_from_response(
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
@@ -764,7 +1182,22 @@ class StreamingMixin:
         # live-zone tracking is a follow-up. Without this fallback the
         # dashboard headline collapses to 0% even when compression is
         # happening (issue #455).
+        # Thinking split and stop_reason for the streaming path. Streaming is
+        # where the agentic traffic is, so without this the split — and the one
+        # feedback signal an adaptive ceiling can learn from — would exist only
+        # for non-streaming requests, which is close to nowhere in practice.
+        #
+        # ``parsed_response`` is the reassembled SSE body: it carries the content
+        # blocks (thinking among them) and stop_reason, which the raw usage chunk
+        # does not.
+        _stream_thinking = _thinking_for_stream(parsed_response)
+        _stream_stop_reason = (
+            parsed_response.get("stop_reason") if isinstance(parsed_response, dict) else None
+        )
         outcome = RequestOutcome.from_stream(
+            thinking_tokens=_stream_thinking.tokens,
+            thinking_inferred=_stream_thinking.inferred,
+            stop_reason=_stream_stop_reason,
             body=body,
             provider=outcome_provider,
             model=model,
@@ -776,8 +1209,9 @@ class StreamingMixin:
             transforms_applied=transforms_applied,
             total_latency_ms=total_latency,
             overhead_ms=optimization_latency,
-            tags=tags,
+            tags=outcome_tags,
             client=client,
+            status_code=status_code,
             log_full_messages=getattr(self.config, "log_full_messages", False),
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
@@ -788,6 +1222,8 @@ class StreamingMixin:
             pipeline_timing=pipeline_timing,
             original_messages=original_messages,
             waste_signals=waste_signals,
+            conversation_key=conversation_key,
+            conversation_tokens_saved=conversation_tokens_saved,
         )
         await self._record_request_outcome(outcome)
 
@@ -816,6 +1252,9 @@ class StreamingMixin:
         memory_request_ctx: Any | None = None,
         outcome_provider: str | None = None,
         waste_signals: dict[str, int] | None = None,
+        session_key: str | None = None,
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -828,7 +1267,76 @@ class StreamingMixin:
         3. Makes continuation requests until no memory tools remain
         4. Streams the final response to the client
         """
+        session_key = session_key or self._get_session_key(body)
+
+        # Guard everything up to the generator's own try/finally (which owns
+        # cleanup once streaming starts): any exception here — including
+        # asyncio.CancelledError from a client disconnect mid-setup — must
+        # still release session_key, or it wedges in _active_streams forever
+        # and every later request on this session gets stuck 202-queued.
+        try:
+            return await self._stream_response_inner(
+                url=url,
+                headers=headers,
+                body=body,
+                provider=provider,
+                model=model,
+                request_id=request_id,
+                original_tokens=original_tokens,
+                optimized_tokens=optimized_tokens,
+                tokens_saved=tokens_saved,
+                transforms_applied=transforms_applied,
+                tags=tags,
+                optimization_latency=optimization_latency,
+                memory_user_id=memory_user_id,
+                pipeline_timing=pipeline_timing,
+                prefix_tracker=prefix_tracker,
+                original_messages=original_messages,
+                original_body_bytes=original_body_bytes,
+                body_mutated=body_mutated,
+                mutation_reasons=mutation_reasons,
+                memory_request_ctx=memory_request_ctx,
+                outcome_provider=outcome_provider,
+                waste_signals=waste_signals,
+                session_key=session_key,
+                conversation_key=conversation_key,
+                conversation_tokens_saved=conversation_tokens_saved,
+            )
+        except (Exception, asyncio.CancelledError):
+            self._cleanup_mid_turn_stream(session_key)
+            raise
+
+    async def _stream_response_inner(
+        self,
+        url: str,
+        headers: dict,
+        body: dict,
+        provider: str,
+        model: str,
+        request_id: str,
+        original_tokens: int,
+        optimized_tokens: int,
+        tokens_saved: int,
+        transforms_applied: list[str],
+        tags: dict[str, str],
+        optimization_latency: float,
+        memory_user_id: str | None,
+        pipeline_timing: dict[str, float] | None,
+        prefix_tracker: Any | None,
+        original_messages: list[dict] | None,
+        original_body_bytes: bytes | None,
+        body_mutated: bool,
+        mutation_reasons: list[str] | None,
+        memory_request_ctx: Any | None,
+        outcome_provider: str | None,
+        waste_signals: dict[str, int] | None,
+        session_key: str,
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
+    ) -> Response | StreamingResponse:
+        """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
+        from starlette.background import BackgroundTask
 
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
@@ -836,6 +1344,15 @@ class StreamingMixin:
         # ...) from the *client's* User-Agent before copilot-auth
         # potentially rewrites headers for upstream.
         client = classify_client(headers)
+        # Mid-turn message coalescing (queueing a concurrent same-session
+        # request and later replaying it via a `headroom_pending_messages`
+        # SSE event) is a Claude Code-only protocol. Only register the stream
+        # as active for coalescing when the client can consume that protocol,
+        # so concurrent requests from other harnesses (e.g. OpenCode subagents
+        # that share a body-derived session key) are streamed normally instead
+        # of being swallowed. (#1608)
+        if supports_mid_turn_coalescing(client):
+            self._active_streams.add(session_key)
         headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
 
@@ -843,18 +1360,20 @@ class StreamingMixin:
         # bytes once before entering the connection-retry loop. When a
         # transform mutated the body we re-serialize canonically; otherwise
         # we forward the original client bytes verbatim.
+        from headroom.proxy.body_forwarding import select_outbound_body
         from headroom.proxy.helpers import (
             capture_codex_wire_debug,
             codex_wire_debug_enabled,
             log_outbound_request,
-            prepare_outbound_body_bytes,
         )
 
-        outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+        outbound = select_outbound_body(
             body=body,
             original_body_bytes=original_body_bytes,
             body_mutated=body_mutated,
+            mutation_reasons=list(mutation_reasons or []),
         )
+        outbound_bytes, outbound_source = outbound.content, outbound.source
         outbound_headers = {**headers, "content-type": "application/json"}
         log_outbound_request(
             forwarder="streaming",
@@ -865,6 +1384,7 @@ class StreamingMixin:
             mutation_reasons=list(mutation_reasons or []),
             request_id=request_id,
             source=outbound_source,
+            dropped_mutation_reasons=outbound.dropped_mutation_reasons,
         )
         _codex_wire_debug = (
             codex_wire_debug_enabled() and provider == "openai" and "/responses" in url
@@ -938,8 +1458,37 @@ class StreamingMixin:
                             headers=dict(upstream_response.headers),
                             status_code=upstream_response.status_code,
                         )
+                    # Retry transient overloads (429 rate-limit, 529 overloaded)
+                    # honoring Retry-After — the streaming sibling of the
+                    # _retry_request path (#1221); on exhaustion, fall through to
+                    # forward the status to the client.
+                    if (
+                        upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
+                        and self.config.retry_enabled
+                        and attempt < retry_attempts - 1
+                    ):
+                        delay_with_jitter = retry_after_ms(
+                            upstream_response, self.config.retry_max_delay_ms
+                        ) or jitter_delay_ms(
+                            self.config.retry_base_delay_ms,
+                            self.config.retry_max_delay_ms,
+                            attempt,
+                        )
+                        await upstream_response.aclose()
+                        logger.warning(
+                            f"[{request_id}] Upstream {upstream_response.status_code} "
+                            f"(attempt {attempt + 1}/{retry_attempts}), "
+                            f"retrying in {delay_with_jitter:.0f}ms"
+                        )
+                        await asyncio.sleep(delay_with_jitter / 1000)
+                        continue
                     break
-                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                # Retry any transport-level failure while opening the upstream
+                # stream — including HTTP/2 protocol errors (Local/RemoteProtocol
+                # `StreamReset`) from a poisoned shared h2 connection. This runs
+                # before any body byte is forwarded to the client, so re-sending
+                # on a fresh connection is safe and avoids a 502. (#1639)
+                except httpx.TransportError as e:
                     last_connect_error = e
                     if attempt >= retry_attempts - 1:
                         raise
@@ -958,9 +1507,23 @@ class StreamingMixin:
 
             if upstream_response is None:
                 raise last_connect_error or RuntimeError("upstream connection did not start")
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        # Retries exhausted (or a transport failure escaped the loop): emit a
+        # clean SSE error instead of letting an h2 StreamReset bubble up as an
+        # unhandled 502. Covers ConnectError/timeouts and Local/RemoteProtocol-
+        # Error. (#1639)
+        #
+        # The status MUST stay non-2xx. No body byte has been forwarded yet, so
+        # the status line is still ours to set, and a 200 here is
+        # indistinguishable — to every Anthropic/OpenAI SDK — from a successful
+        # stream that produced no events: the client reports "empty or malformed
+        # response (HTTP 200)" and cannot retry, because 200 is not retryable.
+        # 502 keeps the structured SSE body for clients that read it while
+        # letting SDK retry logic treat a transient upstream transport failure
+        # as what it is.
+        except httpx.TransportError as e:
             error_msg = str(e) or repr(e)
             logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
+            self.metrics.record_upstream_connection_error(provider)
 
             async def _error_gen():
                 error_event = {
@@ -972,7 +1535,12 @@ class StreamingMixin:
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
-            return StreamingResponse(_error_gen(), media_type="text/event-stream")
+            self._cleanup_mid_turn_stream(session_key)
+            return StreamingResponse(
+                _error_gen(),
+                status_code=502,
+                media_type="text/event-stream",
+            )
 
         # Capture Codex rate-limit window data from the upstream response
         # headers, for *every* status. Codex (gpt-5.x) almost always streams, so
@@ -990,6 +1558,8 @@ class StreamingMixin:
 
         get_codex_rate_limit_state().update_from_headers(dict(upstream_response.headers))
 
+        limit_reset: tuple[float, str] | None = None
+        error_content = b""
         if upstream_response.status_code >= 400:
             logger.warning(
                 "[%s] Forwarding upstream streaming error status=%s url=%s",
@@ -1048,31 +1618,60 @@ class StreamingMixin:
                     status_code=upstream_response.status_code,
                 )
 
-            stream_state["total_bytes"] = len(error_content)
-            await self._finalize_stream_response(
-                body=body,
-                provider=provider,
-                outcome_provider=outcome_provider,
-                model=model,
-                request_id=request_id,
-                original_tokens=original_tokens,
-                optimized_tokens=optimized_tokens,
-                tokens_saved=tokens_saved,
-                transforms_applied=transforms_applied,
-                optimization_latency=optimization_latency,
-                stream_state=stream_state,
-                start_time=start_time,
-                tags=tags,
-                pipeline_timing=pipeline_timing,
-                prefix_tracker=prefix_tracker,
-                original_messages=original_messages,
-                client=client,
-                waste_signals=waste_signals,
+            limit_reset = (
+                _anthropic_limit_reset(upstream_response.status_code, error_content)
+                if provider == "anthropic" and self.config.anthropic_auto_continue_enabled
+                else None
             )
-            return Response(
-                content=error_content,
-                status_code=upstream_response.status_code,
-                headers=response_headers,
+            if (
+                limit_reset is not None
+                and limit_reset[0] > self.config.anthropic_auto_continue_max_wait_seconds
+            ):
+                logger.warning(
+                    "[%s] Anthropic usage-limit reset is %.1fs away, above the "
+                    "configured auto-continue ceiling of %.1fs; forwarding status %s",
+                    request_id,
+                    limit_reset[0],
+                    self.config.anthropic_auto_continue_max_wait_seconds,
+                    upstream_response.status_code,
+                )
+                limit_reset = None
+            if limit_reset is None:
+                stream_state["total_bytes"] = len(error_content)
+                await self._finalize_stream_response(
+                    body=body,
+                    provider=provider,
+                    outcome_provider=outcome_provider,
+                    model=model,
+                    request_id=request_id,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    tokens_saved=tokens_saved,
+                    transforms_applied=transforms_applied,
+                    optimization_latency=optimization_latency,
+                    stream_state=stream_state,
+                    start_time=start_time,
+                    tags=tags,
+                    pipeline_timing=pipeline_timing,
+                    prefix_tracker=prefix_tracker,
+                    original_messages=original_messages,
+                    client=client,
+                    waste_signals=waste_signals,
+                    status_code=upstream_response.status_code,
+                    conversation_key=conversation_key,
+                    conversation_tokens_saved=conversation_tokens_saved,
+                )
+                self._cleanup_mid_turn_stream(session_key)
+                return Response(
+                    content=error_content,
+                    status_code=upstream_response.status_code,
+                    headers=response_headers,
+                )
+            logger.info(
+                "[%s] Auto-continuing after Anthropic usage limit: waiting %.1fs until %s",
+                request_id,
+                limit_reset[0],
+                limit_reset[1],
             )
 
         # Forward upstream rate-limit headers to the client. We pass both the
@@ -1080,10 +1679,16 @@ class StreamingMixin:
         # window/credit headers — the latter do not contain the ``ratelimit``
         # substring, so without the second clause the Codex CLI's own
         # session/weekly display would stop updating on the streaming path.
+        # We also forward the ``request-id`` family: clients such as Claude Code
+        # record it per transcript turn, and downstream usage/cost tools dedup by
+        # message id + request id. The buffered (non-streaming) path already
+        # forwards every upstream header, so this keeps the two paths symmetric.
         forwarded_headers = {
             k: v
             for k, v in upstream_response.headers.items()
-            if "ratelimit" in k.lower() or k.lower().startswith("x-codex")
+            if "ratelimit" in k.lower()
+            or k.lower().startswith("x-codex")
+            or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
 
         async def generate():
@@ -1098,6 +1703,8 @@ class StreamingMixin:
             # corrupted strings.
             full_sse_bytes = bytearray()
             parsed_response = None  # Set by memory block; used by CCR + prefix tracker
+            completed_normally = False
+            pending_messages: list[dict] = []
 
             try:
                 async with contextlib.aclosing(upstream_response) as response:
@@ -1268,6 +1875,7 @@ class StreamingMixin:
                         status_code=upstream_response.status_code,
                         metadata={"total_bytes": stream_state["total_bytes"]},
                     )
+                completed_normally = True
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
@@ -1291,6 +1899,10 @@ class StreamingMixin:
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             finally:
+                pending_messages = self._cleanup_mid_turn_stream(
+                    session_key,
+                    drain_pending_messages=completed_normally,
+                )
                 # PR-A8 / P1-8: best-effort decode for downstream
                 # finalization. This runs in `finally` so it must not
                 # raise — if the upstream sent invalid bytes mid-stream
@@ -1333,12 +1945,227 @@ class StreamingMixin:
                     parsed_response=parsed_response,
                     client=client,
                     waste_signals=waste_signals,
+                    status_code=upstream_response.status_code,
+                    conversation_key=conversation_key,
+                    conversation_tokens_saved=conversation_tokens_saved,
                 )
+                if supports_mid_turn_coalescing(client) and pending_messages:
+                    pending_event = json.dumps(
+                        {"type": "headroom_pending_messages", "messages": pending_messages}
+                    )
+                    yield f"event: headroom_pending_messages\ndata: {pending_event}\n\n".encode()
+
+        async def _release_upstream_stream() -> None:
+            # Guarantee the active upstream HTTP/2 stream is released even when
+            # Starlette stops body iteration after a client disconnect. The
+            # auto-continue path rebinds ``upstream_response`` to its retry, so
+            # this closes whichever response is active when cleanup runs.
+            with contextlib.suppress(Exception):
+                await upstream_response.aclose()
+
+        if limit_reset is not None:
+            sleep_seconds, reset_display = limit_reset
+            wait_attempt_finalized = False
+
+            async def finalize_wait_attempt() -> None:
+                """Account for a wait/retry that never reaches the normal stream finalizer."""
+                nonlocal wait_attempt_finalized
+                if wait_attempt_finalized:
+                    return
+                wait_attempt_finalized = True
+                stream_state["total_bytes"] = len(error_content)
+                await self._finalize_stream_response(
+                    body=body,
+                    provider=provider,
+                    outcome_provider=outcome_provider,
+                    model=model,
+                    request_id=request_id,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    tokens_saved=tokens_saved,
+                    transforms_applied=transforms_applied,
+                    optimization_latency=optimization_latency,
+                    stream_state=stream_state,
+                    start_time=start_time,
+                    tags=tags,
+                    pipeline_timing=pipeline_timing,
+                    prefix_tracker=prefix_tracker,
+                    original_messages=original_messages,
+                    client=client,
+                    waste_signals=waste_signals,
+                )
+
+            async def auto_continue_wrapper():
+                """Keep the client informed, retry once, then splice the real SSE stream."""
+                nonlocal upstream_response
+                retry_stream_started = False
+                try:
+                    message_start = {
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_headroom_wait",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": model,
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        },
+                    }
+                    block_start = {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    wait_text = (
+                        "\n\n⏳ **Headroom**: Anthropic usage limit reached. "
+                        f"Auto-continuing in {sleep_seconds:.0f} seconds at {reset_display}...\n\n"
+                    )
+                    wait_delta = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": wait_text},
+                    }
+                    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n".encode()
+                    yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
+                    yield f"event: content_block_delta\ndata: {json.dumps(wait_delta)}\n\n".encode()
+
+                    remaining = sleep_seconds + 5.0
+                    while remaining > 0:
+                        yield b": headroom-keepalive\n\n"
+                        step = min(15.0, remaining)
+                        await asyncio.sleep(step)
+                        remaining -= step
+
+                    assert self.http_client is not None
+                    retry_request = self.http_client.build_request(
+                        "POST",
+                        url,
+                        content=outbound_bytes,
+                        headers=outbound_headers,
+                    )
+                    try:
+                        retry_response = await self.http_client.send(retry_request, stream=True)
+                    except (Exception, asyncio.CancelledError) as exc:
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
+                        logger.error(
+                            "[%s] Anthropic auto-continue retry failed: %s", request_id, exc
+                        )
+                        await finalize_wait_attempt()
+                        error_text = (
+                            "\n\n❌ Headroom could not reconnect after the usage-limit wait."
+                        )
+                        error_delta = {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": error_text},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(error_delta)}\n\n".encode()
+                        yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                        yield b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n'
+                        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                        return
+
+                    upstream_response = retry_response
+                    if retry_response.status_code >= 400:
+                        await retry_response.aread()
+                        await retry_response.aclose()
+                        logger.error(
+                            "[%s] Anthropic auto-continue retry returned status %s",
+                            request_id,
+                            retry_response.status_code,
+                        )
+                        await finalize_wait_attempt()
+                        error_text = (
+                            "\n\n❌ Headroom retried after the usage-limit wait, but "
+                            f"upstream returned status {retry_response.status_code}."
+                        )
+                        error_delta = {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": error_text},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(error_delta)}\n\n".encode()
+                        yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                        yield b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n'
+                        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                        return
+
+                    buffer = bytearray()
+                    first_block_seen = False
+                    shift_indexes = False
+
+                    def shift_index(match: re.Match[str]) -> str:
+                        return f'"index":{int(match.group(1)) + 1}'
+
+                    retry_stream_started = True
+                    async for chunk in generate():
+                        buffer.extend(chunk)
+                        while b"\n\n" in buffer:
+                            event_bytes, buffer = buffer.split(b"\n\n", 1)
+                            try:
+                                event_text = event_bytes.decode("utf-8")
+                            except UnicodeDecodeError:
+                                # Unknown/invalid upstream events are not safe to
+                                # rewrite; preserve their bytes exactly.
+                                yield bytes(event_bytes) + b"\n\n"
+                                continue
+                            if event_text.startswith("event: message_start"):
+                                continue
+                            if event_text.startswith("event: content_block_start"):
+                                if not first_block_seen:
+                                    first_block_seen = True
+                                    if (
+                                        '"type":"text"' in event_text
+                                        or '"type": "text"' in event_text
+                                    ):
+                                        continue
+                                    yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                                    shift_indexes = True
+                                if shift_indexes:
+                                    event_text = re.sub(
+                                        r'"index"\s*:\s*(\d+)',
+                                        shift_index,
+                                        event_text,
+                                    )
+                                    yield f"{event_text}\n\n".encode()
+                                    continue
+                            if shift_indexes and event_text.startswith(
+                                ("event: content_block_delta", "event: content_block_stop")
+                            ):
+                                event_text = re.sub(
+                                    r'"index"\s*:\s*(\d+)',
+                                    shift_index,
+                                    event_text,
+                                )
+                                yield f"{event_text}\n\n".encode()
+                                continue
+                            yield bytes(event_bytes) + b"\n\n"
+                    if buffer:
+                        # Preserve an upstream tail even when it omits the final
+                        # SSE separator instead of silently truncating it.
+                        yield bytes(buffer)
+                except asyncio.CancelledError:
+                    if not retry_stream_started:
+                        await asyncio.shield(finalize_wait_attempt())
+                    raise
+                finally:
+                    self._cleanup_mid_turn_stream(session_key)
+
+            return StreamingResponse(
+                auto_continue_wrapper(),
+                media_type="text/event-stream",
+                headers=forwarded_headers,
+                background=BackgroundTask(_release_upstream_stream),
+            )
 
         return StreamingResponse(
             generate(),
             media_type="text/event-stream",
             headers=forwarded_headers,
+            background=BackgroundTask(_release_upstream_stream),
         )
 
     async def _stream_response_bedrock(
@@ -1356,14 +2183,31 @@ class StreamingMixin:
         optimization_latency: float,
         pipeline_timing: dict[str, float] | None = None,
         original_messages: list[dict] | None = None,
+        prefix_tracker: Any | None = None,
+        optimized_messages: list[dict] | None = None,
+        backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream response from Bedrock backend with metrics tracking.
 
         Translates Bedrock streaming events to Anthropic SSE format.
+
+        ``prefix_tracker``/``optimized_messages`` carry the
+        :class:`PrefixCacheTracker` for the session so cache stats from
+        this turn update the tracker for the next one — mirrors the
+        direct streaming path (``_finalize_stream_response``) and the
+        OpenAI-via-backend sibling (``_stream_openai_via_backend``).
+        Without this, ``extract_cache_stable_delta()`` always sees no
+        previous turn on the Bedrock path and cache mode never compresses
+        anything past the first request in a session.
         """
         from fastapi.responses import StreamingResponse
 
         from headroom.proxy.outcome import RequestOutcome
+
+        # ``backend`` lets the caller serve this one request from somewhere
+        # other than the configured backend (see proxy/route_advice.py). None
+        # means "the configured one", i.e. what this method always did.
+        backend = backend if backend is not None else self.anthropic_backend
 
         client = classify_client(headers)
 
@@ -1381,22 +2225,53 @@ class StreamingMixin:
             "cache_creation_ephemeral_5m_input_tokens": 0,
             "cache_creation_ephemeral_1h_input_tokens": 0,
         }
+        # Bytes-level mirror of the SSE stream, used only to reconstruct
+        # the final assistant message for the prefix tracker once the
+        # stream closes (see finally: block below). Not on the hot path
+        # for anything the client sees.
+        full_sse_bytes = bytearray()
 
         async def generate():
             try:
-                assert self.anthropic_backend is not None
+                assert backend is not None
 
-                async for event in self.anthropic_backend.stream_message(body, headers):
+                # Emit a synthetic ping before the first message_start so that
+                # downstream clients (e.g. Claude Code) arm their mid-turn
+                # steering / interruptible state.  The Bedrock-to-Anthropic
+                # translation layer never produces SSE-level keepalives; we
+                # synthesise one here to match the real Anthropic wire format
+                # (issue #902).
+                yield b"event: ping\ndata: {}\n\n"
+
+                async for event in backend.stream_message(body, headers):
                     # Record TTFB on first event
                     if stream_state["ttfb_ms"] is None:
                         stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
 
+                    # Backfill input_tokens on message_start (issue #1132).
+                    # LiteLLM/Bedrock streaming never surfaces prompt tokens
+                    # (only output_tokens, at the end), so the backend emits
+                    # message_start with usage.input_tokens=0. Anthropic clients
+                    # (e.g. Claude Code) read input_tokens from message_start and
+                    # would otherwise report ~0 input for every request. Inject
+                    # the token count Headroom actually sent upstream
+                    # (optimized_tokens) when the backend left it unset/zero, so
+                    # downstream metrics reflect real usage. A non-zero value
+                    # already reported by the backend is preserved untouched.
+                    if event.event_type == "message_start" and not event.raw_sse:
+                        msg_usage = event.data.setdefault("message", {}).setdefault("usage", {})
+                        if not msg_usage.get("input_tokens") and optimized_tokens > 0:
+                            msg_usage["input_tokens"] = optimized_tokens
+
                     # Format as SSE
                     if event.raw_sse:
-                        yield event.raw_sse.encode()
+                        chunk_bytes = event.raw_sse.encode()
                     else:
                         sse_line = f"event: {event.event_type}\ndata: {json.dumps(event.data)}\n\n"
-                        yield sse_line.encode()
+                        chunk_bytes = sse_line.encode()
+                    if prefix_tracker is not None:
+                        full_sse_bytes.extend(chunk_bytes)
+                    yield chunk_bytes
 
                     # Track usage from message_start event
                     if event.event_type == "message_start":
@@ -1419,6 +2294,16 @@ class StreamingMixin:
                         usage = event.data.get("usage", {})
                         if "output_tokens" in usage:
                             stream_state["output_tokens"] = usage["output_tokens"]
+                        if "input_tokens" in usage:
+                            stream_state["input_tokens"] = usage["input_tokens"]
+                        if "cache_read_input_tokens" in usage:
+                            stream_state["cache_read_input_tokens"] = usage[
+                                "cache_read_input_tokens"
+                            ]
+                        if "cache_creation_input_tokens" in usage:
+                            stream_state["cache_creation_input_tokens"] = usage[
+                                "cache_creation_input_tokens"
+                            ]
 
                     # Handle errors
                     if event.event_type == "error":
@@ -1434,9 +2319,54 @@ class StreamingMixin:
 
             finally:
                 total_latency = (time.time() - start_time) * 1000
-                _backend_name = (
-                    self.anthropic_backend.name if self.anthropic_backend else "anthropic"
-                )
+                _backend_name = backend.name if backend else "anthropic"
+
+                # Update prefix cache tracker for the next turn — mirrors
+                # _finalize_stream_response (direct-API streaming path)
+                # and _stream_openai_via_backend (OpenAI-via-backend
+                # sibling). Run before the outcome funnel so prefix state
+                # is consistent regardless of metric path.
+                if prefix_tracker is not None:
+                    import copy as _copy
+
+                    tracker_messages = (
+                        optimized_messages
+                        if optimized_messages is not None
+                        else body.get("messages", [])
+                    )
+                    next_forwarded = _copy.deepcopy(tracker_messages)
+                    next_original = _copy.deepcopy(original_messages or tracker_messages)
+                    if full_sse_bytes:
+                        parsed = self._parse_sse_to_response(
+                            full_sse_bytes.decode("utf-8", errors="replace"), provider
+                        )
+                        asst_msg = self._assistant_message_from_response_json(parsed)
+                        if asst_msg is not None:
+                            next_forwarded.append(_copy.deepcopy(asst_msg))
+                            next_original.append(_copy.deepcopy(asst_msg))
+                    cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
+                    cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0
+                    if provider == "anthropic" and hasattr(prefix_tracker, "classify_cache_miss"):
+                        miss = prefix_tracker.classify_cache_miss(
+                            cache_read_tokens=cache_read_tokens,
+                            current_forwarded_messages=tracker_messages,
+                        )
+                        if miss.is_miss:
+                            logger.info(
+                                f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
+                                f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
+                                f"expected_cached={miss.expected_cached_tokens:,} "
+                                f"prefix_changed={miss.prefix_changed} "
+                                f"ttl_exceeded={miss.ttl_exceeded}"
+                            )
+                            await self.metrics.record_cache_miss_attribution(provider, miss.reason)
+                    prefix_tracker.update_from_response(
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                        messages=next_forwarded,
+                        original_messages=next_original,
+                    )
+
                 # Active-compression denominator derived inside
                 # ``from_stream`` as ``optimized + saved``. Bedrock
                 # doesn't propagate frozen_message_count either — same
@@ -1488,6 +2418,7 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
 
@@ -1522,7 +2453,11 @@ class StreamingMixin:
         from headroom.proxy.handlers.openai import _infer_openai_cache_write_tokens
         from headroom.proxy.outcome import RequestOutcome
 
-        assert self.anthropic_backend is not None
+        # ``backend`` lets the caller serve this one request from somewhere
+        # other than the configured backend (see proxy/route_advice.py). None
+        # means "the configured one", i.e. what this method always did.
+        backend = backend if backend is not None else self.anthropic_backend
+        assert backend is not None
         client = classify_client(headers)
 
         async def generate():
@@ -1552,7 +2487,7 @@ class StreamingMixin:
                         stream_state[key] = usage[key]
 
             try:
-                async for sse_chunk in self.anthropic_backend.stream_openai_message(body, headers):
+                async for sse_chunk in backend.stream_openai_message(body, headers):
                     chunk_bytes = sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
                     stream_state["sse_buffer"].extend(chunk_bytes)
                     full_sse_bytes.extend(chunk_bytes)
@@ -1654,7 +2589,7 @@ class StreamingMixin:
                 # instead of collapsing the dashboard headline to 0%.
                 outcome = RequestOutcome.from_stream(
                     body=body,
-                    provider=self.anthropic_backend.name,
+                    provider=backend.name,
                     model=model,
                     request_id=request_id,
                     original_tokens=original_tokens,
@@ -1679,7 +2614,7 @@ class StreamingMixin:
                 if tokens_saved > 0:
                     logger.info(
                         f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
-                        f"(saved {tokens_saved:,} tokens) via {self.anthropic_backend.name} [stream]"
+                        f"(saved {tokens_saved:,} tokens) via {backend.name} [stream]"
                     )
 
         return StreamingResponse(
