@@ -66,6 +66,7 @@ from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.nonstream_sse_policy import should_recover_sse_reply
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
+from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 from headroom.utils import format_exception_message
 
@@ -431,6 +432,25 @@ class AnthropicHandlerMixin:
         return (name, canonical)
 
     @staticmethod
+    def _server_memory_tool_names(tools: Any, client_tools: Any) -> frozenset[str]:
+        """Memory tools in ``tools`` that the proxy injected and must run itself.
+
+        A memory tool the client declared stays the client's: its calls are
+        forwarded, not withheld.
+        """
+        from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES, NATIVE_MEMORY_TOOL_NAME
+
+        client_tool_names = {t.get("name") for t in client_tools or [] if isinstance(t, dict)}
+        return frozenset(
+            name
+            for t in tools or []
+            if isinstance(t, dict)
+            and isinstance(name := t.get("name"), str)
+            and (name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME)
+            and name not in client_tool_names
+        )
+
+    @staticmethod
     def _has_headroom_retrieve_tool(tools: Any) -> bool:
         """Return True when the final Anthropic tool list includes CCR retrieve."""
         if not isinstance(tools, list):
@@ -635,6 +655,11 @@ class AnthropicHandlerMixin:
         first text block of the latest user message is mutated, which is by
         definition the live zone.
 
+        Trailing ``role: "system"`` messages are skipped when locating that
+        turn: Claude Code appends one after the user message (environment
+        context carrying the cache breakpoint), and it is not a conversational
+        turn. It is left byte-identical.
+
         Returns the input list unchanged if no eligible user text block
         exists (e.g., the last message is an assistant turn or a tool
         result, or the user message has no text block).
@@ -643,7 +668,9 @@ class AnthropicHandlerMixin:
             return messages
 
         i = len(messages) - 1
-        if i < frozen_message_count:
+        while i >= 0 and messages[i].get("role") == "system":
+            i -= 1
+        if i < 0 or i < frozen_message_count:
             return messages
         msg = messages[i]
         if msg.get("role") != "user":
@@ -932,6 +959,20 @@ class AnthropicHandlerMixin:
         auth_mode = classify_auth_mode(request.headers)
         request.state.auth_mode = auth_mode
         logger.debug(f"[{request_id}] auth_mode_classified mode={auth_mode.value}")
+
+        # Phase F PR-F3: resolve the per-tenant key for TOIN learning
+        # isolation. `set_request_tenant_key` populates the ContextVar
+        # the deep-stack `record_compression` / `record_retrieval` calls
+        # in SmartCrusher / ContentRouter read from. Pre-F3 every
+        # request's patterns aggregated into one global pool — F3
+        # partitions by header / hash / global namespace so two
+        # tenants can't cross-pollinate compression patterns. The
+        # resolver itself emits the structured `tenant_key_resolved`
+        # log on every call.
+        tenant_key, tenant_key_source = resolve_tenant_key(request)
+        request.state.tenant_key = tenant_key
+        request.state.tenant_key_source = tenant_key_source
+        set_request_tenant_key(tenant_key)
 
         # Unit 2: per-stage timings for the pre-upstream phase. The
         # finalizer emits one structured log line + Prometheus
@@ -1249,7 +1290,16 @@ class AnthropicHandlerMixin:
 
                 _sub_tracker = _get_sub_tracker()
                 if _sub_tracker is not None:
-                    _sub_tracker.notify_active(_auth_header)
+                    from headroom.subscription.credential_policy import (
+                        is_local_operator_connection,
+                    )
+
+                    # Only the local operator's bearer may become the polled
+                    # account; a network caller only marks activity (01-F16).
+                    _sub_tracker.notify_active(
+                        _auth_header,
+                        from_local_operator=is_local_operator_connection(request),
+                    )
 
             # Rate limiting
             if self.rate_limiter:
@@ -2706,6 +2756,9 @@ class AnthropicHandlerMixin:
             # /v1/messages just as on /v1/responses.
             memory_context_injected = False
             memory_tools_injected = False
+            # Memory tools this proxy injected and must execute itself; the
+            # streaming path withholds their calls from the client.
+            server_memory_tool_names: frozenset[str] = frozenset()
             if memory_decision.inject:
                 # Search and inject memory context
                 if self.memory_handler.config.inject_context:
@@ -2817,6 +2870,9 @@ class AnthropicHandlerMixin:
                 )
                 if mem_tools_injected:
                     memory_tools_injected = True
+                    server_memory_tool_names = self._server_memory_tool_names(
+                        tools, _original_tools
+                    )
                     tool_names = [
                         t.get("name") or t.get("type", "")
                         for t in tools
@@ -4036,6 +4092,7 @@ class AnthropicHandlerMixin:
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
                         session_key=session_key,
+                        server_memory_tool_names=server_memory_tool_names,
                     )
                 else:
                     # Whatever set it — the client's own ``stream: false`` or
