@@ -41,6 +41,16 @@ This plugin closes the loop by calling the proxy's `POST /v1/retrieve` HTTP endp
 
 3. Restart the Hermes gateway / TUI (plugin discovery is cached per process).
 
+## Supported Hermes providers
+
+`headroom wrap hermes` sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`. Hermes uses these only for the `anthropic` and `openai` providers. Its default provider (`openrouter`) and others such as `nous` call their own endpoints and skip Headroom. You must pick a routed provider with `--provider`, for example:
+
+```bash
+headroom wrap hermes -- --provider anthropic
+```
+
+The wrapper stops with an error before it starts the proxy or Hermes when `--provider` is missing or is not `anthropic` or `openai`. This includes a provider set only in `~/.hermes/config.yaml`. To use another provider, run `hermes` directly, without Headroom.
+
 ## Recommended proxy configuration
 
 Hermes tool names don't match headroom's built-in `DEFAULT_EXCLUDE_TOOLS` (which protects Claude Code's `Read`/`Grep`/`Edit`/...), so two exclusions are strongly recommended on the proxy side:
@@ -55,7 +65,7 @@ HEADROOM_EXCLUDE_TOOLS=read_file,headroom_retrieve
 ## Behavior
 
 - Accepts the bare hash or the whole marker — `<<ccr:abc123,base64,4.5KB>>`, `ccr:abc123`, and `hash=abc123` are all normalized to `abc123`.
-- Optional `query` parameter filters very large results via the proxy's BM25 search.
+- Retrieval is by hash and always returns the full original content.
 - Clear, actionable errors: expired hash (TTL) and proxy-unreachable cases both tell the model to re-run the original command instead of retrying blindly.
 
 ## Requirements

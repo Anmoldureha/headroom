@@ -224,12 +224,6 @@ export function binDir(): string {
   return joinPath(workspaceDir(), "bin");
 }
 
-export function rtkPath(): string {
-  if (!isNode()) return "";
-  const name = process.platform === "win32" ? "rtk.exe" : "rtk";
-  return joinPath(binDir(), name);
-}
-
 export function deployRoot(): string {
   if (!isNode()) return "";
   return joinPath(workspaceDir(), "deploy");
@@ -254,7 +248,16 @@ export function modelsConfigPath(): string {
 // ---------------------------------------------------------------------------
 
 function assertPluginName(name: string): void {
-  if (!name || name.includes("/") || name.includes("\\")) {
+  // Same rule as the Python twin (headroom/paths.py): "." and ".." would resolve
+  // to plugins/ itself or to the parent, and NUL ends a path in POSIX APIs.
+  if (
+    !name ||
+    name === "." ||
+    name === ".." ||
+    name.includes("/") ||
+    name.includes("\\") ||
+    name.includes("\0")
+  ) {
     throw new Error(`invalid plugin name: ${JSON.stringify(name)}`);
   }
 }

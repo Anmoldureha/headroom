@@ -13,14 +13,16 @@ single-process production deployments.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from headroom.memory.adapters.graph_models import Entity, Relationship, Subgraph
-from headroom.memory.models import Memory
+from headroom.memory.models import Memory, normalize_entity_refs
 from headroom.memory.ports import MemorySearchResult
 from headroom.models.config import ML_MODEL_DEFAULTS
 
@@ -116,6 +118,19 @@ class LocalBackend:
         self._initialized = False
         self._hierarchical_memory: HierarchicalMemory | None = None
         self._graph: InMemoryGraphStore | SQLiteGraphStore | None = None
+        # Async singleflight guard for lazy init. Per-project backends handed
+        # out by BackendRouter init lazily on first use; concurrent first
+        # callers must land on ONE init (double-checked pattern below) instead
+        # of racing N partial inits that leave ``_hierarchical_memory`` None
+        # and trip the ``assert`` guards downstream. Created lazily so the
+        # backend can be constructed before an event loop exists.
+        self._init_lock: asyncio.Lock | None = None
+
+    def _get_init_lock(self) -> asyncio.Lock:
+        """Lazily create the init lock bound to the running event loop."""
+        if self._init_lock is None:
+            self._init_lock = asyncio.Lock()
+        return self._init_lock
 
     async def _ensure_initialized(self) -> None:
         """Ensure the backend is initialized with all components.
@@ -123,62 +138,92 @@ class LocalBackend:
         Creates the HierarchicalMemory system and graph store on first use.
         Uses SQLiteGraphStore (bounded, persistent) when graph_persist=True,
         or InMemoryGraphStore (unbounded, volatile) when graph_persist=False.
+
+        Singleflight via ``self._init_lock`` with a double-checked flag:
+        concurrent first callers await the same cold-start (which can exceed
+        a second on the ``pytorch_mps`` embedder) rather than each kicking off
+        a parallel init. If a slow init is cancelled (e.g. an outer
+        ``asyncio.wait_for`` timeout), state is reset so a later call retries
+        cleanly and ``CancelledError`` is re-raised rather than leaving the
+        backend half-built.
         """
-        if not self._initialized:
-            from headroom.memory import HierarchicalMemory, MemoryConfig
-            from headroom.memory.config import EmbedderBackend
+        # Fast path: already initialized, no lock contention.
+        if self._initialized:
+            return
 
-            # Map string embedder_backend to enum
-            embedder_backend_map = {
-                "local": EmbedderBackend.LOCAL,
-                "onnx": EmbedderBackend.ONNX,
-                "openai": EmbedderBackend.OPENAI,
-                "ollama": EmbedderBackend.OLLAMA,
-            }
-            embedder_backend = embedder_backend_map.get(
-                self._config.embedder_backend, EmbedderBackend.LOCAL
-            )
+        lock = self._get_init_lock()
+        async with lock:
+            # Double-check after acquiring the lock — another task may have
+            # finished the init while we were waiting.
+            if self._initialized:
+                return
+            try:
+                await self._init_locked()
+            except asyncio.CancelledError:
+                # Cancellation (e.g. wait_for timeout) can leave a partial
+                # backend. Reset so the next call re-inits from scratch and
+                # never sees a half-built ``_hierarchical_memory``.
+                self._hierarchical_memory = None
+                self._graph = None
+                self._initialized = False
+                raise
 
-            mem_config = MemoryConfig(
-                db_path=Path(self._config.db_path),
-                embedder_backend=embedder_backend,
-                embedder_model=self._config.embedder_model,
-                vector_dimension=self._config.vector_dimension,
-                openai_api_key=self._config.openai_api_key,
-                ollama_base_url=self._config.ollama_base_url,
-                cache_enabled=self._config.cache_enabled,
-                cache_max_size=self._config.cache_max_size,
-            )
+    async def _init_locked(self) -> None:
+        """Actual init body. Must be called with ``_init_lock`` held."""
+        from headroom.memory import HierarchicalMemory, MemoryConfig
+        from headroom.memory.config import EmbedderBackend
 
-            self._hierarchical_memory = await HierarchicalMemory.create(mem_config)
+        # Map string embedder_backend to enum
+        embedder_backend_map = {
+            "local": EmbedderBackend.LOCAL,
+            "onnx": EmbedderBackend.ONNX,
+            "openai": EmbedderBackend.OPENAI,
+            "ollama": EmbedderBackend.OLLAMA,
+        }
+        embedder_backend = embedder_backend_map.get(
+            self._config.embedder_backend, EmbedderBackend.LOCAL
+        )
 
-            # Choose graph store based on config
-            if self._config.graph_persist:
-                from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
+        mem_config = MemoryConfig(
+            db_path=Path(self._config.db_path),
+            embedder_backend=embedder_backend,
+            embedder_model=self._config.embedder_model,
+            vector_dimension=self._config.vector_dimension,
+            openai_api_key=self._config.openai_api_key,
+            ollama_base_url=self._config.ollama_base_url,
+            cache_enabled=self._config.cache_enabled,
+            cache_max_size=self._config.cache_max_size,
+        )
 
-                # Derive graph db path from main db path if not specified
-                if self._config.graph_db_path:
-                    graph_db_path = self._config.graph_db_path
-                else:
-                    # "memory.db" -> "memory_graph.db"
-                    db_path = Path(self._config.db_path)
-                    graph_db_path = str(db_path.parent / f"{db_path.stem}_graph{db_path.suffix}")
+        self._hierarchical_memory = await HierarchicalMemory.create(mem_config)
 
-                self._graph = SQLiteGraphStore(
-                    db_path=graph_db_path,
-                    page_cache_size_kb=self._config.graph_cache_size_kb,
-                )
-                logger.info(
-                    f"LocalBackend: Using SQLiteGraphStore at {graph_db_path} "
-                    f"(cache: {self._config.graph_cache_size_kb}KB)"
-                )
+        # Choose graph store based on config
+        if self._config.graph_persist:
+            from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
+
+            # Derive graph db path from main db path if not specified
+            if self._config.graph_db_path:
+                graph_db_path = self._config.graph_db_path
             else:
-                from headroom.memory.adapters.graph import InMemoryGraphStore
+                # "memory.db" -> "memory_graph.db"
+                db_path = Path(self._config.db_path)
+                graph_db_path = str(db_path.parent / f"{db_path.stem}_graph{db_path.suffix}")
 
-                self._graph = InMemoryGraphStore()
-                logger.info("LocalBackend: Using InMemoryGraphStore (unbounded)")
+            self._graph = SQLiteGraphStore(
+                db_path=graph_db_path,
+                page_cache_size_kb=self._config.graph_cache_size_kb,
+            )
+            logger.info(
+                f"LocalBackend: Using SQLiteGraphStore at {graph_db_path} "
+                f"(cache: {self._config.graph_cache_size_kb}KB)"
+            )
+        else:
+            from headroom.memory.adapters.graph import InMemoryGraphStore
 
-            self._initialized = True
+            self._graph = InMemoryGraphStore()
+            logger.info("LocalBackend: Using InMemoryGraphStore (unbounded)")
+
+        self._initialized = True
 
     # =========================================================================
     # Core Memory Operations
@@ -240,8 +285,15 @@ class LocalBackend:
         # Determine if using pre-extraction mode
         has_pre_extraction = bool(facts or extracted_entities or extracted_relationships)
 
-        # Merge entity names from both simple and typed formats
-        all_entity_names: list[str] = list(entities) if entities else []
+        # Merge entity names from both simple and typed formats.
+        #
+        # `entities` is typed list[str], but it is populated straight from
+        # LLM-supplied memory_save tool arguments, and callers do sometimes
+        # pass the typed {"entity": ..., "entity_type": ...} shape here (that
+        # is what extracted_entities is for). Normalizing keeps those dicts out
+        # of entity_refs, where they used to crash every later search that
+        # retrieved the row -- see issue #2947.
+        all_entity_names: list[str] = normalize_entity_refs(entities)
         entity_types: dict[str, str] = {}
 
         if extracted_entities:
@@ -335,7 +387,9 @@ class LocalBackend:
                 for rel in all_relationships:
                     source_name = rel.get("source", "").lower()
                     target_name = rel.get("target", "").lower()
-                    rel_type = rel.get("type", "related_to")
+                    # The memory_save tool schema names the key `relation`
+                    # (tools.py); direct callers and older docs use `type`.
+                    rel_type = rel.get("type") or rel.get("relation") or "related_to"
 
                     source_id = entity_id_map.get(source_name)
                     target_id = entity_id_map.get(target_name)
@@ -353,6 +407,19 @@ class LocalBackend:
 
         # Return primary memory
         return primary_memory
+
+    async def prepare_search_query(self, user_text: str, context: str) -> str:
+        """Apply the active local model's query window, including on cold backends."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        prepare: Callable[[str, str], Awaitable[str]] | None = getattr(
+            self._hierarchical_memory.embedder, "prepare_query", None
+        )
+        if prepare is not None:
+            return await prepare(user_text, context)
+        # Remote embedders do not expose their tokenizer; callers still supply
+        # character-bounded sources, without claiming a remote token guarantee.
+        return "\n".join(part for part in (user_text, context) if part)
 
     async def search_memories(
         self,
@@ -404,13 +471,17 @@ class LocalBackend:
                 continue
 
             seen_memory_ids.add(vr.memory.id)
-            all_entity_refs.update(vr.memory.entity_refs)
+            # Defense in depth: the storage adapters normalize entity_refs on
+            # load, but a backend that hands us Memory objects some other way
+            # must not be able to abort the whole search with one bad row.
+            entity_refs = normalize_entity_refs(vr.memory.entity_refs)
+            all_entity_refs.update(entity_refs)
 
             results.append(
                 MemorySearchResult(
                     memory=vr.memory,
                     score=vr.similarity,
-                    related_entities=list(vr.memory.entity_refs),
+                    related_entities=entity_refs,
                     related_memories=[],
                 )
             )
@@ -444,24 +515,32 @@ class LocalBackend:
                 new_memory_ids = related_memory_ids - seen_memory_ids
                 for mem_id in new_memory_ids:
                     memory = await self._hierarchical_memory.get(mem_id)
-                    if memory and memory.user_id == user_id:
-                        # Filter by session_id if specified (security: prevent session leakage)
-                        if session_id is not None and memory.session_id != session_id:
-                            continue
-                        # Add with lower score since it's from graph expansion
-                        results.append(
-                            MemorySearchResult(
-                                memory=memory,
-                                score=0.5,  # Default score for graph-expanded results
-                                related_entities=list(memory.entity_refs),
-                                related_memories=[],
-                            )
+                    if (
+                        memory is None
+                        or memory.user_id != user_id
+                        or memory.valid_until is not None
+                        or memory.superseded_by is not None
+                    ):
+                        continue
+                    # Filter by session_id if specified (security: prevent session leakage)
+                    if session_id is not None and memory.session_id != session_id:
+                        continue
+                    # Add with lower score since it's from graph expansion
+                    results.append(
+                        MemorySearchResult(
+                            memory=memory,
+                            score=0.5,  # Default score for graph-expanded results
+                            related_entities=normalize_entity_refs(memory.entity_refs),
+                            related_memories=[],
                         )
-                        seen_memory_ids.add(mem_id)
+                    )
+                    seen_memory_ids.add(mem_id)
 
-        # Filter by specified entities if provided
+        # Filter by specified entities if provided. Like the save path, this
+        # argument arrives from LLM-supplied tool input, so it gets the same
+        # normalization rather than trusting its list[str] annotation.
         if entities:
-            entities_lower = {e.lower() for e in entities}
+            entities_lower = {e.lower() for e in normalize_entity_refs(entities)}
             results = [
                 r
                 for r in results
@@ -471,6 +550,18 @@ class LocalBackend:
         # Sort by score and limit
         results.sort(key=lambda x: x.score, reverse=True)
         return results[:top_k]
+
+    async def record_access(self, memory_ids: list[str]) -> int:
+        """Record retrieval metadata for memories returned to a caller."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        return await self._hierarchical_memory.record_access(memory_ids)
+
+    async def refresh_memory_indexes(self, memory_id: str) -> Memory | None:
+        """Refresh vector metadata and cache state from the primary store."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        return await self._hierarchical_memory.refresh_memory_indexes(memory_id)
 
     async def update_memory(
         self,
@@ -488,7 +579,8 @@ class LocalBackend:
             memory_id: ID of the memory to update.
             new_content: The new content for the memory.
             reason: Reason for the update (stored for audit trail).
-            user_id: User ID for validation (optional).
+            user_id: When given, only a memory owned by this user is updated;
+                any other id is treated as not found.
 
         Returns:
             The new Memory that supersedes the old one.
@@ -496,12 +588,15 @@ class LocalBackend:
         Raises:
             ValueError: If the memory is not found.
         """
-        # Note: reason and user_id are accepted for protocol compliance
-        # but not yet used in the underlying implementation
+        # Note: reason is accepted for protocol compliance but not yet stored.
         _ = reason
-        _ = user_id
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
+
+        if user_id is not None:
+            existing = await self._hierarchical_memory.get(memory_id)
+            if existing is None or existing.user_id != user_id:
+                raise ValueError(f"Memory {memory_id} not found")
 
         # Use supersede for versioned updates
         new_memory = await self._hierarchical_memory.supersede(
@@ -510,6 +605,19 @@ class LocalBackend:
         )
 
         return new_memory
+
+    async def detach_supersession(
+        self,
+        old_memory_id: str,
+        new_memory_id: str,
+    ) -> tuple[Memory, Memory]:
+        """Detach one explicit supersession edge and refresh indexes."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        return await self._hierarchical_memory.detach_supersession(
+            old_memory_id,
+            new_memory_id,
+        )
 
     async def delete_memory(
         self,
@@ -526,22 +634,21 @@ class LocalBackend:
         Args:
             memory_id: ID of the memory to delete.
             reason: Reason for deletion (stored for audit trail).
-            user_id: User ID for validation (optional).
+            user_id: When given, only a memory owned by this user is deleted;
+                any other id is treated as not found.
 
         Returns:
             True if the memory was deleted, False if not found.
         """
-        # Note: reason and user_id are accepted for protocol compliance
-        # but not yet used in the underlying implementation
+        # Note: reason is accepted for protocol compliance but not yet stored.
         _ = reason
-        _ = user_id
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
         assert self._graph is not None
 
         # Get memory to find its user_id for graph cleanup
         memory = await self._hierarchical_memory.get(memory_id)
-        if memory is None:
+        if memory is None or (user_id is not None and memory.user_id != user_id):
             return False
 
         # Delete from HierarchicalMemory
@@ -658,13 +765,13 @@ class LocalBackend:
     async def get_user_memories(
         self,
         user_id: str,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> list[Memory]:
         """Get all memories for a user.
 
         Args:
             user_id: User identifier.
-            limit: Maximum number of memories to return.
+            limit: Maximum number of memories to return, or None for all memories.
 
         Returns:
             List of memories for the user.
@@ -674,6 +781,21 @@ class LocalBackend:
 
         return await self._hierarchical_memory.get_user_memories(
             user_id=user_id,
+            limit=limit,
+        )
+
+    async def get_session_memories(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int = 100,
+    ) -> list[Memory]:
+        """List recent memories filtered by both user and session before limiting."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        return await self._hierarchical_memory.get_session_memories(
+            user_id=user_id,
+            session_id=session_id,
             limit=limit,
         )
 
@@ -751,7 +873,7 @@ class LocalBackend:
             MemorySearchResult(
                 memory=tr.memory,
                 score=tr.score,
-                related_entities=list(tr.memory.entity_refs),
+                related_entities=normalize_entity_refs(tr.memory.entity_refs),
                 related_memories=[],
             )
             for tr in text_results

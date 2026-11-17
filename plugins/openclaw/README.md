@@ -2,6 +2,8 @@
 
 Context compression plugin for [OpenClaw](https://github.com/openclaw/openclaw). Compresses tool outputs, code, logs, and structured data — 70-90% token savings with zero LLM calls.
 
+Tool-call normalization preserves provider metadata, including thought signatures, when restoring assistant turns after compression.
+
 ## Install
 
 Recommended one-command setup:
@@ -20,6 +22,9 @@ openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw
 This plugin can auto-start a local `headroom proxy` when needed. OpenClaw treats process-launching plugins as unsafe by default, so `--dangerously-force-unsafe-install` is required even if you plan to use a remote proxy (the capability is declared at install time).
 
 ## Local Development Install (Detection-Friendly)
+
+Building from source requires Node.js `^22.18.0 || ^24.11.0 || >=26.0.0` for the tsup 9 toolchain. Use a supported Node release before running `npm ci` and `npm run build`. This is a source-build requirement; the published plugin uses the Node runtime supported by your OpenClaw host and does not run tsup during plugin loading.
+
 
 If you are testing from this repo, run npm install/build from the plugin directory so local launcher detection aligns with runtime paths. These linked installs are supported:
 
@@ -77,11 +82,12 @@ Install automatically selects the `contextEngine` slot for `headroom` on current
 - `http://127.0.0.1:<proxyPort>`
 - `http://localhost:<proxyPort>`
 
-Default `proxyPort` is `8787`.
+Default `proxyPort` is `8787`. Auto-start is opt-in; in production, prefer an externally
+managed proxy such as systemd with `proxyUrl` set and `autoStart: false`.
 
 ### Upstream gateway routing
 
-By default, the plugin also rewrites the built-in `openai-codex` provider base URL to the active Headroom proxy at runtime. That means Codex provider traffic flows through Headroom, so `/stats` can observe real upstream request and cache activity instead of only local context compression.
+By default, the plugin also rewrites the built-in `openai-codex` provider base URL to a verified active Headroom proxy at runtime. That means Codex provider traffic flows through Headroom, so `/stats` can observe real upstream request and cache activity instead of only local context compression.
 
 This does not replace Headroom's existing Codex routing rules. The proxy already decides between `api.openai.com` and `chatgpt.com/backend-api/codex/responses` based on ChatGPT auth. The plugin change only points OpenClaw's provider config at the active proxy in memory and preserves the rest of the provider config.
 
@@ -199,20 +205,26 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `proxyUrl` | auto-detected | Optional URL of a Headroom proxy. Local addresses (`http://127.0.0.1:<port>`, `http://localhost:<port>`) enable auto-start; remote URLs (`https://headroom.example.com`) are connect-only. |
-| `proxyPort` | `8787` | Port used for default auto-detect/auto-start when `proxyUrl` is not set. |
+| `proxyUrl` | auto-detected | Optional URL of a Headroom proxy. Configured URLs are probe-gated before provider routing. Remote URLs (`https://headroom.example.com`) are connect-only. |
+| `proxyPort` | `8787` | Port used for default auto-detect and optional local auto-start when `proxyUrl` is not set. |
 | `pythonPath` | auto-detected | Optional Python executable override for Python fallback launcher. |
-| `autoStart` | `true` | Auto-start a local `headroom proxy` if not already running (local URLs only; ignored for remote proxies) |
+| `autoStart` | `false` | Opt-in auto-start for a local `headroom proxy` if not already running (local URLs only; ignored for remote proxies). Keep `false` when systemd owns the proxy. |
 | `startupTimeoutMs` | `20000` | Time to wait for auto-started proxy to become healthy |
+| `requestTimeoutMs` | `2000` | Maximum milliseconds to wait for a single `compress()` call. The SDK aborts the request at this deadline and the original messages are used as a fallback. |
+| `minContextChars` | `800` | Skip proxy compression below this approximate 200-token context floor. Large single tool results still qualify; set to `0` to disable the gate. |
+| `circuitBreakerThreshold` | `3` | Number of consecutive `assemble()` failures before the circuit breaker opens and all requests bypass the proxy. Counts every way the proxy can fail a call — connection errors, timeouts, 5xx responses, and results that come back with no token count. Prevents cascading failures when the proxy is unhealthy. |
+| `circuitBreakerCooldownMs` | `60000` | How long (ms) the circuit breaker stays open after the threshold is reached. After the cool-down the breaker resets automatically and the next `assemble()` call re-probes the proxy by attempting a real compression. |
 | `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider to use the active Headroom proxy in memory so upstream Codex requests pass through Headroom. |
 | `gatewayProviderIds` | `[]` | Optional explicit list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases `codex`, `claude`, `copilot`, and `gemini` are also accepted. When set, this overrides the default `openai-codex` routing list. |
+| `announceCompression` | `true` | Adds a static, cache-stable notice to the system prompt the first time a session compresses more than 100 tokens, then keeps it unchanged for the rest of the session. Set to `false` to guarantee Headroom never modifies the system prompt. |
+| `commitLogPath` | `$HEADROOM_WORKSPACE_DIR/openclaw/commit-log.json`, else `~/.headroom/openclaw/commit-log.json` | Where the plugin records each turn OpenClaw has accepted (one small marker file per turn, in a sibling `commit-log.d/` directory), so a retried commit is answered as a duplicate even after a restart. Must be on a writable filesystem: on a read-only root (common in Kubernetes), point this or `HEADROOM_WORKSPACE_DIR` at a writable volume. While commits fail, OpenClaw 2026.9.9+ runs each later turn of the session on its legacy context path. |
 
 ## Comparison with lossless-claw
 
 | | lossless-claw | headroom |
 |---|---|---|
-| Compaction method | LLM summarization (DAG) | Content-aware compression (zero LLM) |
-| Cost of compaction | Tokens (LLM calls) | Zero |
+| Compaction method | LLM summarization (DAG) | OpenClaw native compaction (delegated) |
+| Cost of compaction | Tokens (LLM calls) | OpenClaw configuration-dependent |
 | Best for | Long conversations | Tool-heavy agents with large outputs |
 | Retrieval | `lcm_grep`, `lcm_expand` | `headroom_retrieve` (instant) |
 

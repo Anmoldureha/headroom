@@ -9,11 +9,12 @@ embedding, indexing, caching, and memory bubbling.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from headroom.memory.config import MemoryConfig
-from headroom.memory.factory import create_memory_system
+from headroom.memory.factory import _adapt_text_search, create_memory_system
 from headroom.memory.models import Memory, ScopeLevel
 from headroom.memory.ports import MemoryFilter, TextFilter, VectorFilter
 
@@ -95,6 +96,7 @@ class HierarchicalMemory:
         self._store = store
         self._vector_index = vector_index
         self._text_index = text_index
+        self._search_text = _adapt_text_search(text_index)
         self._embedder = embedder
         self._cache = cache
         self._config = config or MemoryConfig()
@@ -187,6 +189,8 @@ class HierarchicalMemory:
             embedding = await self._embedder.embed(content)
             memory.embedding = embedding
 
+        self._validate_embedding(memory)
+
         # Save to store
         await self._store.save(memory)
 
@@ -255,6 +259,10 @@ class HierarchicalMemory:
             for memory, embedding in zip(memories, embeddings):
                 memory.embedding = embedding
 
+        # Validate the whole batch before persisting any of its rows.
+        for memory in memories:
+            self._validate_embedding(memory)
+
         # Batch save
         await self._store.save_batch(memories)
 
@@ -303,6 +311,21 @@ class HierarchicalMemory:
             await self._cache.put(memory)
 
         return memory
+
+    async def record_access(
+        self,
+        memory_ids: list[str],
+        accessed_at: datetime | None = None,
+    ) -> int:
+        """Record retrieval metadata for memories returned to a caller."""
+        unique_ids = list(dict.fromkeys(memory_ids))
+        if not unique_ids:
+            return 0
+
+        updated = await self._store.record_access(unique_ids, accessed_at)
+        if self._cache is not None:
+            await self._cache.invalidate_batch(unique_ids)
+        return updated
 
     async def query(self, filter: MemoryFilter) -> list[Memory]:
         """Query memories with filtering.
@@ -423,7 +446,7 @@ class HierarchicalMemory:
             limit=limit,
         )
 
-        return await self._text_index.search(text_filter)
+        return await self._search_text(text_filter)
 
     # =========================================================================
     # Memory Updates
@@ -460,6 +483,11 @@ class HierarchicalMemory:
         content_changed = False
 
         if content is not None and content != memory.content:
+            # Validate before mutating a possibly shared store/cache object.
+            if re_embed:
+                embedding = await self._embedder.embed(content)
+                self._validate_embedding(replace(memory, embedding=embedding))
+                memory.embedding = embedding
             memory.content = content
             content_changed = True
 
@@ -472,20 +500,35 @@ class HierarchicalMemory:
         if metadata is not None:
             memory.metadata.update(metadata)
 
-        # Re-embed if content changed
-        if content_changed and re_embed:
-            memory.embedding = await self._embedder.embed(memory.content)
-
         # Save updates
         await self._store.save(memory)
 
-        # Update indexes
+        # Vector indexes also carry filterable metadata. Refresh them for
+        # metadata-only updates, not just when the embedding content changes.
+        vector_metadata_changed = any(
+            value is not None for value in (importance, entity_refs, metadata)
+        )
+        if (content_changed or vector_metadata_changed) and memory.embedding is not None:
+            await self._vector_index.index(memory)
         if content_changed:
-            if memory.embedding is not None:
-                await self._vector_index.index(memory)
             await self._index_for_text_search(memory)
 
         # Invalidate and re-cache
+        if self._cache is not None:
+            await self._cache.invalidate(memory_id)
+            await self._cache.put(memory)
+
+        return memory
+
+    async def refresh_memory_indexes(self, memory_id: str) -> Memory | None:
+        """Refresh secondary index metadata from the primary memory store."""
+        memory = await self._store.get(memory_id)
+        if memory is None:
+            return None
+
+        if memory.embedding is not None:
+            await self._vector_index.index(memory)
+
         if self._cache is not None:
             await self._cache.invalidate(memory_id)
             await self._cache.put(memory)
@@ -544,8 +587,20 @@ class HierarchicalMemory:
         if auto_embed:
             new_memory.embedding = await self._embedder.embed(new_content)
 
+        self._validate_embedding(new_memory)
+
         # Perform supersession in store
         new_memory = await self._store.supersede(old_memory_id, new_memory, supersede_time)
+
+        # Drop the OLD entry from the search indexes. The store keeps its row
+        # (valid_until is now set) so get_history still works, but the vector and
+        # text indexes hold a cached metadata copy with valid_until=None, and
+        # default search filters superseded rows off that cached copy. Without
+        # this, the superseded (stale) version keeps resurfacing from search
+        # alongside the new one, so contradictory/outdated facts get recalled
+        # together. Mirrors delete()'s index removal.
+        await self._vector_index.remove(old_memory_id)
+        await self._text_index.remove(old_memory_id)
 
         # Update indexes
         if new_memory.embedding is not None:
@@ -559,6 +614,39 @@ class HierarchicalMemory:
 
         logger.debug(f"Superseded memory {old_memory_id} with {new_memory.id}")
         return new_memory
+
+    async def detach_supersession(
+        self,
+        old_memory_id: str,
+        new_memory_id: str,
+    ) -> tuple[Memory, Memory]:
+        """Detach one explicit, reciprocal supersession edge.
+
+        The store performs the atomic lineage repair. Both affected memories
+        are then re-indexed so the restored old memory is immediately
+        searchable and index metadata reflects the repaired lineage.
+        """
+        old_memory, new_memory = await self._store.detach_supersession(
+            old_memory_id,
+            new_memory_id,
+        )
+
+        for memory in (old_memory, new_memory):
+            if memory.embedding is not None:
+                await self._vector_index.index(memory)
+            await self._index_for_text_search(memory)
+
+        if self._cache is not None:
+            memory_ids = [old_memory.id, new_memory.id]
+            await self._cache.invalidate_batch(memory_ids)
+            await self._cache.put_batch([old_memory, new_memory])
+
+        logger.info(
+            "Detached supersession edge %s -> %s",
+            old_memory_id,
+            new_memory_id,
+        )
+        return old_memory, new_memory
 
     async def get_history(
         self,
@@ -713,14 +801,14 @@ class HierarchicalMemory:
     async def get_user_memories(
         self,
         user_id: str,
-        limit: int = 100,
+        limit: int | None = 100,
         include_sessions: bool = True,
     ) -> list[Memory]:
         """Get all memories for a user.
 
         Args:
             user_id: User identifier.
-            limit: Maximum memories to return.
+            limit: Maximum memories to return, or None for all matching memories.
             include_sessions: If True, include session-level memories.
                             If False, only return user-level memories.
 
@@ -763,6 +851,17 @@ class HierarchicalMemory:
     # =========================================================================
     # Internal Methods
     # =========================================================================
+
+    def _validate_embedding(self, memory: Memory) -> None:
+        """Reject incompatible vectors before changing the primary store."""
+        if memory.embedding is not None and memory.embedding.shape != (
+            self._vector_index.dimension,
+        ):
+            raise ValueError(
+                f"Embedding shape {memory.embedding.shape} does not match "
+                f"index dimension {self._vector_index.dimension}; configure vector_dimension "
+                "to match the embedder"
+            )
 
     async def _index_for_text_search(self, memory: Memory) -> None:
         """Index a memory for full-text search.
@@ -816,15 +915,6 @@ class HierarchicalMemory:
         logger.debug(
             f"Bubbled memory {memory.id} from {current_scope.value} to {target_scope.value}"
         )
-
-    def _scope_level_value(self, level: ScopeLevel) -> int:
-        """Get numeric value for scope level (lower = broader scope)."""
-        return {
-            ScopeLevel.USER: 0,
-            ScopeLevel.SESSION: 1,
-            ScopeLevel.AGENT: 2,
-            ScopeLevel.TURN: 3,
-        }[level]
 
     # =========================================================================
     # Properties

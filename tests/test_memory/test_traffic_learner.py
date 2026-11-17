@@ -6,6 +6,8 @@ a real memory backend.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -16,10 +18,8 @@ from headroom.memory.traffic_learner import (
     TrafficLearner,
     _bash_binaries_match,
     _bash_first_binary,
-    _classify_error,
     _commands_related_as_retry,
     _drop_contradictions,
-    _is_error,
     _levenshtein,
     _load_persisted_patterns_from_sqlite,
     _normalize_bash_for_hash,
@@ -38,28 +38,145 @@ UTC = timezone.utc
 
 
 class TestErrorClassification:
-    def test_file_not_found(self):
-        assert _classify_error("No such file or directory: foo.py") == "file_not_found"
-        assert _classify_error("FileNotFoundError: [Errno 2]") == "file_not_found"
+    """The learner classifies tool output with the shared learn classifier."""
 
-    def test_command_not_found(self):
-        assert _classify_error("zsh: command not found: ruff") == "command_not_found"
+    @pytest.fixture
+    def learner(self):
+        return TrafficLearner(backend=None, user_id="test-user", min_evidence=1)
 
-    def test_module_not_found(self):
-        assert _classify_error("ModuleNotFoundError: No module named 'foo'") == "module_not_found"
+    @staticmethod
+    def _openai_result(learner: TrafficLearner, output: str) -> dict:
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "shell", "arguments": '{"command": "ls"}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": output},
+        ]
+        return learner.extract_tool_results_from_openai_messages(messages)[0]
 
-    def test_permission_denied(self):
-        assert _classify_error("Permission denied: /etc/shadow") == "permission_denied"
+    @pytest.mark.parametrize(
+        ("output", "is_error"),
+        [
+            # Successful shell commands from Codex/Grok/opencode end in "exit code 0".
+            ("Process exited with exit code 0\nall tests passed", False),
+            ("README.md\nsrc\nexit code 0", False),
+            # Nonzero exit codes and other exit-failure wording.
+            ("Exit code: 1\nWall time: 0.2s\nOutput:\nfail", True),
+            ("exit code 2", True),
+            ("Command failed with non-zero status 1", True),
+            ("process exited with status 1", True),
+            ("x" * 1500 + "\nexit code 3", True),
+            ("command terminated\nexit code -9", True),
+            ("Process exited with exit code -1", True),
+            # A zero wrapper status must not hide a separate failure.
+            ("worker exited with signal 9\nexit code 0", True),
+            ("child exit code 2\nwrapper exit code 0", True),
+            ("python train.py\nKilled\n", True),
+            # A successful command may print the word; exit code 0 then wins.
+            ("grep result:\nKilled\nexit code 0", False),
+            ("task killed by signal SIGKILL\nexit code 0", True),
+            # A bare Killed is an error even below the short-content cut-off,
+            # but a reported zero status wins over a printed "Killed".
+            ("Killed", True),
+            ("Killed\nexit code 0", False),
+            # The wrapper's zero status belongs to its own line.
+            ("worker exited with an error\nwrapper exit code 0", True),
+            # One status phrase wrapped across lines is still one zero status.
+            ("Process exited with\nexit code 0", False),
+            ("Killed: 9", True),
+            # Case-insensitive signals the shared is_error_content would miss.
+            ("zsh: no such file or directory: ./run.sh", True),
+            ("fatal: path 'x' does not exist in 'HEAD'", True),
+            ("open /etc/shadow: permission denied", True),
+            ("EACCES: permission denied, open '/x'", True),
+            ("Operation not permitted (EPERM) on /x", True),
+            ("File content exceeds maximum allowed tokens limit (25000)", True),
+            ("file is too large to read", True),
+            ("Exception: something broke badly", True),
+            ("context deadline exceeded while dialing", True),
+            ("x" * 1500 + "\nTraceback (most recent call last):\nValueError: late", True),
+            # Signals the old detector already caught.
+            ("No such file or directory: foo.py", True),
+            ("ModuleNotFoundError: No module named 'foo'", True),
+            ("zsh: command not found: ruff", True),
+            ("Tool call auto-denied by policy", True),
+            ("IndentationError: unexpected indent here", True),
+            ("TimeoutError: deadline exceeded after 30s", True),
+            ("Command timed out after 120s", True),
+            ("BUILD FAILED in 3s", True),
+            # Not errors.
+            ("All tests passed, everything is fine", False),
+            ("2 failed, 10 passed in 1.2s", False),
+            ("Checked 4 files, no errors found in output", False),
+            ("short", False),
+            ("", False),
+        ],
+    )
+    def test_error_detection(self, learner: TrafficLearner, output: str, is_error: bool):
+        assert self._openai_result(learner, output)["is_error"] is is_error
 
-    def test_not_an_error(self):
-        assert _classify_error("Everything is fine, tests passed!") is None
-        assert _classify_error("") is None
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("output", "category"),
+        [
+            ("No such file or directory: foo.py", "file_not_found"),
+            ("zsh: command not found: ruff", "command_not_found"),
+            ("ModuleNotFoundError: No module named 'foo'", "module_not_found"),
+            ("Permission denied: /etc/shadow", "permission_denied"),
+            ("TimeoutError: deadline exceeded after 30s", "timeout"),
+            ("ConnectionError: [Errno 111] Connection refused", "connection_error"),
+            ("task killed by signal SIGKILL", "exit_code"),
+            ("python train.py\nKilled", "exit_code"),
+            ("Killed: 9", "exit_code"),
+        ],
+    )
+    async def test_error_category_recorded(
+        self, learner: TrafficLearner, output: str, category: str
+    ):
+        await learner.on_tool_result(
+            tool_name="Bash", tool_input={"command": "x"}, tool_output=output, is_error=True
+        )
+        assert learner._tool_history[-1]["error_category"] == category
 
-    def test_is_error_helper(self):
-        assert _is_error("No such file or directory")
-        assert not _is_error("All tests passed")
-        assert not _is_error("")
-        assert not _is_error("short")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("output", "is_error", "category"),
+        [
+            ("Killed", True, "exit_code"),
+            ("worker exited with an error\nwrapper exit code 0", True, "exit_code"),
+            ("Killed\nexit code 0", False, None),
+            ("README.md\nsrc\nexit code 0", False, None),
+            ("worker killed by signal SIGKILL\nwrapper exit code 0", True, "exit_code"),
+            ("command terminated\nexit code -9", True, "exit_code"),
+        ],
+    )
+    async def test_openai_result_recorded_through_on_tool_result(
+        self, learner: TrafficLearner, output: str, is_error: bool, category: str | None
+    ):
+        """End to end: the OpenAI extractor's verdict is what on_tool_result records."""
+        result = self._openai_result(learner, output)
+        await learner.on_tool_result(
+            tool_name=result["tool_name"],
+            tool_input=result["input"],
+            tool_output=result["output"],
+            is_error=result["is_error"],
+        )
+        recorded = learner._tool_history[-1]
+        assert recorded["is_error"] is is_error
+        assert recorded["error_category"] == category
+
+    @pytest.mark.asyncio
+    async def test_success_has_no_error_category(self, learner: TrafficLearner):
+        await learner.on_tool_result(
+            tool_name="Bash",
+            tool_input={"command": "x"},
+            tool_output="Everything is fine, tests passed!",
+            is_error=False,
+        )
+        assert learner._tool_history[-1]["error_category"] is None
 
 
 # =============================================================================
@@ -113,6 +230,23 @@ class TestCommandsRelatedAsRetry:
             "/Users/x/src-tauri/src/state.rs 2>&1 | head -10"
         )
         assert not _commands_related_as_retry(failed, success)
+
+    def test_shared_cd_prefix_alone_is_not_retry(self):
+        # Agents prefix most commands with the same `cd <repo> &&`; that shared
+        # prefix used to satisfy both the binary and the token-overlap checks.
+        cd = 'cd "C:\\Users\\dev\\my-project" && '
+        assert not _commands_related_as_retry(
+            cd + "npx vitest run src/form.test.tsx", cd + "git add -A && git commit -F -"
+        )
+        assert not _commands_related_as_retry(
+            "cd /home/dev/my-project && sed -n '90,130p' app/actions.ts",
+            "cd /home/dev/my-project && cat components/icons.ts",
+        )
+
+    def test_cd_prefixed_retry_still_matches(self):
+        assert _commands_related_as_retry(
+            "cd /home/dev/proj && cargo build", "cd /home/dev/proj && cargo build --release"
+        )
 
     def test_empty_or_equal_commands_rejected(self):
         assert not _commands_related_as_retry("", "ls")
@@ -360,28 +494,32 @@ class TestTrafficLearner:
         stats = learner.get_stats()
         assert stats["patterns_extracted"] >= 3
 
-    @pytest.mark.asyncio
-    async def test_dedup(self, learner: TrafficLearner):
-        """Test that identical patterns are deduplicated."""
-        # Same pattern twice
-        for _ in range(2):
-            await learner.on_tool_result(
-                tool_name="Bash",
-                tool_input={"command": "ruff check ."},
-                tool_output="command not found: ruff",
-                is_error=True,
-            )
-            await learner.on_tool_result(
-                tool_name="Bash",
-                tool_input={"command": ".venv/bin/ruff check ."},
-                tool_output="OK",
-                is_error=False,
-            )
+    def test_pending_accumulator_is_bounded(self):
+        """One-off patterns that never reach ``min_evidence`` must not grow the
+        pending ``_pattern_counts`` accumulator without bound — the sibling
+        ``_saved_hashes`` is already trimmed to ``dedup_window`` and this one was
+        missed, so a long-lived proxy leaked memory across varied traffic. It is
+        now LRU-capped at ``max_pending_patterns``.
 
-        # Should not double-count the same pattern
-        stats = learner.get_stats()
-        # First extraction saves, second is deduped
-        assert stats["patterns_extracted"] >= 1
+        Sync test (drives the async accumulate via ``asyncio.run``) so it runs
+        without the pytest-asyncio plugin.
+        """
+        import asyncio
+
+        learner = TrafficLearner(backend=None, min_evidence=5, max_pending_patterns=8)
+
+        async def feed_one_offs() -> None:
+            for i in range(500):
+                await learner._accumulate(
+                    ExtractedPattern(
+                        category=PatternCategory.PREFERENCE,
+                        content=f"one-off pattern number {i}",
+                        importance=0.5,
+                    )
+                )
+
+        asyncio.run(feed_one_offs())
+        assert len(learner._pattern_counts) <= 8  # capped, not 500
 
     @pytest.mark.asyncio
     async def test_extract_tool_results_from_messages(self, learner: TrafficLearner):
@@ -415,6 +553,82 @@ class TestTrafficLearner:
         assert results[0]["tool_name"] == "Bash"
         assert "file1.py" in results[0]["output"]
         assert not results[0]["is_error"]
+
+    def test_extract_tool_results_from_openai_messages(self, learner: TrafficLearner):
+        """OpenAI chat/completions tool results: assistant tool_calls + role:tool.
+
+        Regression for the chat-path portion of #2060 — the extractor must
+        resolve the tool name from the assistant ``tool_calls`` id map, parse the
+        ``arguments`` JSON string into a dict (so downstream ``input.get(...)``
+        works), join list content, and sniff errors from the output.
+        """
+        messages = [
+            {"role": "user", "content": "run the tests"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"command": "pytest -q"}'},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"file_path": "/a/b.py"}'},
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "Traceback (most recent call last):\nModuleNotFoundError: No module named x",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": [{"type": "text", "text": "file body"}],
+            },
+        ]
+
+        results = learner.extract_tool_results_from_openai_messages(messages)
+        assert len(results) == 2
+
+        by_name = {r["tool_name"]: r for r in results}
+        assert by_name["bash"]["input"] == {"command": "pytest -q"}  # parsed to dict
+        assert by_name["bash"]["input"].get("command") == "pytest -q"  # downstream .get works
+        assert by_name["bash"]["is_error"] is True
+
+        assert by_name["read_file"]["input"] == {"file_path": "/a/b.py"}
+        assert by_name["read_file"]["output"] == "file body"  # list content joined
+        assert by_name["read_file"]["is_error"] is False
+
+    def test_extract_openai_tool_results_handles_malformed_and_orphans(
+        self, learner: TrafficLearner
+    ):
+        """Malformed arguments become an empty dict; an unmatched tool_call_id
+        yields ``unknown`` — neither raises, so on_tool_result stays safe."""
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "c1", "function": {"name": "grep", "arguments": "not json"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "missing", "content": "orphan"},
+        ]
+
+        results = learner.extract_tool_results_from_openai_messages(messages)
+        assert results[0]["tool_name"] == "grep"
+        assert results[0]["input"] == {}
+        assert results[1]["tool_name"] == "unknown"
+        assert results[1]["input"] == {}
+
+    def test_extract_openai_tool_results_empty_without_tool_messages(self, learner: TrafficLearner):
+        assert (
+            learner.extract_tool_results_from_openai_messages([{"role": "user", "content": "hi"}])
+            == []
+        )
 
     @pytest.mark.asyncio
     async def test_tool_history_bounded(self, learner: TrafficLearner):
@@ -557,6 +771,7 @@ class TestLoadPersistedPatterns:
         conn.execute(
             "CREATE TABLE memories ("
             "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "user_id TEXT NOT NULL DEFAULT 'default', "
             "metadata TEXT NOT NULL DEFAULT '{}', "
             "entity_refs TEXT NOT NULL DEFAULT '[]', "
             "importance REAL NOT NULL DEFAULT 0.5, "
@@ -602,7 +817,7 @@ class TestLoadPersistedPatterns:
                 },
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].evidence_count == 5
         assert patterns[0].category == PatternCategory.ERROR_RECOVERY
@@ -624,7 +839,7 @@ class TestLoadPersistedPatterns:
                 },
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].content == "From traffic"
 
@@ -642,7 +857,7 @@ class TestLoadPersistedPatterns:
                 },
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].importance == 0.85
 
@@ -656,7 +871,7 @@ class TestLoadPersistedPatterns:
                 },
             ],
         )
-        assert _load_persisted_patterns_from_sqlite(db) == []
+        assert _load_persisted_patterns_from_sqlite(db, "default") == []
 
 
 # =============================================================================
@@ -680,6 +895,8 @@ class TestPatternsToRecommendations:
         assert len(recs) == 1
         assert recs[0].target == RecommendationTarget.MEMORY_FILE
         assert "User prefers terse output" in recs[0].content
+        assert "<!-- headroom:pattern-id:" in recs[0].content
+        assert recs[0].preserve_prior_items is True
 
     def test_routes_environment_to_context_file(self):
         from headroom.learn.models import RecommendationTarget
@@ -718,6 +935,77 @@ class TestPatternsToRecommendations:
         assert lines[0] == "- B"
         assert lines[1] == "- A"
         assert recs[0].evidence_count == 7
+        assert recs[0].preserve_prior_items is False
+
+    def test_active_item_ids_span_every_live_pattern(self):
+        """The lifecycle signal covers the whole live set, not just rendered bullets."""
+        preference = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="User prefers terse output",
+            importance=0.8,
+            evidence_count=3,
+        )
+        environment = ExtractedPattern(
+            category=PatternCategory.ENVIRONMENT,
+            content="Use uv run python",
+            importance=0.7,
+            evidence_count=4,
+        )
+
+        recs = _patterns_to_recommendations([preference, environment])
+
+        assert len(recs) == 2
+        expected = frozenset({preference.content_hash, environment.content_hash})
+        for rec in recs:
+            # Each section renders one bullet but claims both ids as active, so
+            # a prior item this batch left out is not read as expired.
+            assert len(rec.content.splitlines()) == 1
+            assert rec.active_item_ids == expected
+
+    def test_error_recovery_carries_no_active_item_ids(self):
+        """error_recovery replaces its section, so it exposes no preservation signal."""
+        recs = _patterns_to_recommendations(
+            [
+                ExtractedPattern(
+                    category=PatternCategory.ERROR_RECOVERY,
+                    content="A",
+                    importance=0.5,
+                    evidence_count=2,
+                ),
+            ]
+        )
+
+        assert len(recs) == 1
+        assert recs[0].active_item_ids is None
+
+    def test_pattern_dropped_from_live_set_is_removed_from_the_file(self, tmp_path):
+        """End-to-end removal invariant: an expired pattern leaves the memory file."""
+        from headroom.learn.writer import _merge_into_file
+
+        keep = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="User prefers terse output",
+            importance=0.8,
+            evidence_count=3,
+        )
+        expired = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="User prefers the legacy migration script",
+            importance=0.8,
+            evidence_count=3,
+        )
+        memory_file = tmp_path / "MEMORY.md"
+        memory_file.write_text(
+            _merge_into_file(memory_file, _patterns_to_recommendations([keep, expired])),
+            encoding="utf-8",
+        )
+        assert "User prefers the legacy migration script" in memory_file.read_text()
+
+        # Next render: the learner no longer holds the expired pattern.
+        final = _merge_into_file(memory_file, _patterns_to_recommendations([keep]))
+
+        assert "User prefers terse output" in final
+        assert "User prefers the legacy migration script" not in final
 
 
 # =============================================================================
@@ -776,6 +1064,10 @@ class _FakeBackend:
 
         self._config = _types.SimpleNamespace(db_path=str(db_path))
         self._db_path = str(db_path)
+        self.refreshed_ids = []
+
+    async def refresh_memory_indexes(self, memory_id: str):
+        self.refreshed_ids.append(memory_id)
 
     async def save_memory(
         self,
@@ -794,9 +1086,9 @@ class _FakeBackend:
         conn = _sql.connect(self._db_path)
         try:
             conn.execute(
-                "INSERT INTO memories (id, content, metadata, entity_refs, importance) "
-                "VALUES (?,?,?,?,?)",
-                (mid, content, _json.dumps(metadata), "[]", importance),
+                "INSERT INTO memories (id, content, user_id, metadata, entity_refs, importance) "
+                "VALUES (?,?,?,?,?,?)",
+                (mid, content, user_id, _json.dumps(metadata), "[]", importance),
             )
             conn.commit()
         finally:
@@ -811,6 +1103,7 @@ def _init_db(path):
     conn.execute(
         "CREATE TABLE memories ("
         "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+        "user_id TEXT NOT NULL DEFAULT 'default', "
         "metadata TEXT NOT NULL DEFAULT '{}', "
         "entity_refs TEXT NOT NULL DEFAULT '[]', "
         "importance REAL NOT NULL DEFAULT 0.5, "
@@ -848,7 +1141,534 @@ async def _wait_for_saved(learner: TrafficLearner, count: int, db_path) -> None:
     )
 
 
+async def _wait_for_evidence(db_path, content, count):
+    for _ in range(100):
+        found = [
+            meta["evidence_count"]
+            for _, text, meta in _read_traffic_rows(db_path)
+            if text == content
+        ]
+        if found == [count]:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"Expected one row with evidence {count}; got {found}")
+
+
+class _ObservedBackend(_FakeBackend):
+    def __init__(self, db_path):
+        super().__init__(db_path)
+        self.entered = asyncio.Event()
+        self.attempted = asyncio.Event()
+        self.release = None
+        self.committed = asyncio.Event()
+        self.after_commit_release = None
+        self.fail_after_commit = False
+
+    async def save_memory(self, **kwargs):
+        self.entered.set()
+        try:
+            if self.release is not None:
+                await self.release.wait()
+            memory = await super().save_memory(**kwargs)
+            self.committed.set()
+            if self.after_commit_release is not None:
+                await self.after_commit_release.wait()
+            if self.fail_after_commit:
+                raise RuntimeError("indexing failed after commit")
+            return memory
+        finally:
+            self.attempted.set()
+
+
+class TestSaveRecovery:
+    @staticmethod
+    async def _feed(learner, content, count):
+        for _ in range(count):
+            await learner._accumulate(
+                ExtractedPattern(
+                    category=PatternCategory.PREFERENCE,
+                    content=content,
+                    importance=0.7,
+                )
+            )
+
+    @pytest.mark.asyncio
+    async def test_failed_save_retries_with_accumulated_evidence(self, tmp_path):
+        import sqlite3
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_save BEFORE INSERT ON memories "
+                "BEGIN SELECT RAISE(ABORT, 'backend unavailable'); END"
+            )
+        backend = _ObservedBackend(db)
+        backend.release = asyncio.Event()
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        await learner.start()
+        try:
+            await self._feed(learner, "Use uv for Python packages.", 3)
+            await asyncio.wait_for(backend.entered.wait(), 2)
+            await self._feed(learner, "Use uv for Python packages.", 2)
+            backend.release.set()
+            await asyncio.wait_for(backend.attempted.wait(), 2)
+            assert _read_traffic_rows(db) == []
+            with sqlite3.connect(db) as conn:
+                conn.execute("DROP TRIGGER reject_save")
+            await self._feed(learner, "Use uv for Python packages.", 1)
+            await _wait_for_saved(learner, 1, db)
+        finally:
+            await learner.stop()
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][1] == "Use uv for Python packages."
+        assert rows[0][2]["evidence_count"] == 6
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("in_flight", [False, True])
+    async def test_queued_and_inflight_observations_reach_the_saved_row(self, tmp_path, in_flight):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _ObservedBackend(db)
+        backend.release = asyncio.Event()
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        content = "Use uv for Python packages."
+        try:
+            if in_flight:
+                await learner.start()
+                await self._feed(learner, content, 3)
+                await asyncio.wait_for(backend.entered.wait(), 2)
+                await self._feed(learner, content, 2)
+                backend.release.set()
+            else:
+                await self._feed(learner, content, 5)
+                backend.release.set()
+                await learner.start()
+            await _wait_for_evidence(db, content, 5)
+        finally:
+            backend.release.set()
+            await learner.stop()
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][2]["evidence_count"] == 5
+        assert _parse_iso_timestamp(rows[0][2]["last_seen_at"]) >= _parse_iso_timestamp(
+            rows[0][2]["first_seen_at"]
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancelled", [False, True])
+    async def test_postcommit_failure_or_cancellation_reuses_the_committed_row(
+        self, tmp_path, cancelled
+    ):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _ObservedBackend(db)
+        backend.after_commit_release = asyncio.Event()
+        backend.fail_after_commit = not cancelled
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        content = "Use uv for Python packages."
+        await learner.start()
+        try:
+            await self._feed(learner, content, 3)
+            await asyncio.wait_for(backend.committed.wait(), 2)
+            committed = _read_traffic_rows(db)
+            assert len(committed) == 1
+            assert committed[0][2]["evidence_count"] == 3
+            await self._feed(learner, content, 2)
+            if cancelled:
+                await learner.stop()
+                learner = TrafficLearner(backend=backend, min_evidence=3)
+                await learner.start()
+            else:
+                backend.after_commit_release.set()
+                await asyncio.wait_for(backend.attempted.wait(), 2)
+            backend.fail_after_commit = False
+            backend.after_commit_release.set()
+            await self._feed(learner, content, 1)
+            await _wait_for_evidence(db, content, 6)
+        finally:
+            backend.after_commit_release.set()
+            await learner.stop()
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][0] == committed[0][0]
+        assert rows[0][2]["evidence_count"] == 6
+
+    @pytest.mark.asyncio
+    async def test_repeated_index_repair_failures_remain_pending(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _ObservedBackend(db)
+        backend.fail_after_commit = True
+        refresh = backend.refresh_memory_indexes
+        refresh_attempted = asyncio.Event()
+        failures_left = 2
+
+        async def failing_refresh(memory_id):
+            nonlocal failures_left
+            try:
+                if failures_left:
+                    failures_left -= 1
+                    raise RuntimeError("index unavailable")
+                await refresh(memory_id)
+            finally:
+                refresh_attempted.set()
+
+        backend.refresh_memory_indexes = failing_refresh
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        content = "Use uv for Python packages."
+        await learner.start()
+        try:
+            await self._feed(learner, content, 3)
+            await asyncio.wait_for(backend.attempted.wait(), 2)
+            committed = _read_traffic_rows(db)
+            assert len(committed) == 1
+            memory_id, _, metadata = committed[0]
+            h = metadata["content_hash"]
+            save_token = metadata["learner_save_token"]
+            assert h not in learner._saved_hashes
+            assert learner._pattern_counts[h][1] == 3
+            assert learner._save_tokens[h] == save_token
+
+            for extra, expected in ((2, 5), (1, 6)):
+                refresh_attempted.clear()
+                await self._feed(learner, content, extra)
+                await asyncio.wait_for(refresh_attempted.wait(), 2)
+                rows = _read_traffic_rows(db)
+                assert len(rows) == 1
+                assert rows[0][0] == memory_id
+                assert rows[0][2]["evidence_count"] == expected
+                assert rows[0][2]["learner_saved_evidence"] == expected
+                assert h not in learner._saved_hashes
+                assert learner._pattern_counts[h][1] == expected
+                assert learner._save_tokens[h] == save_token
+
+            refresh_attempted.clear()
+            await self._feed(learner, content, 1)
+            await asyncio.wait_for(refresh_attempted.wait(), 2)
+            rows = _read_traffic_rows(db)
+            assert len(rows) == 1
+            assert rows[0][0] == memory_id
+            assert rows[0][2]["evidence_count"] == 7
+            assert rows[0][2]["learner_saved_evidence"] == 7
+            assert h in learner._saved_hashes
+            assert h not in learner._pattern_counts
+            assert h not in learner._save_tokens
+        finally:
+            await learner.stop()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_keeps_failed_evidence_and_drains_other_queued_saves(self, tmp_path):
+        import sqlite3
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        failed = "Use uv for Python packages."
+        saved = "Keep pull request descriptions short."
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_one_save BEFORE INSERT ON memories "
+                "WHEN NEW.content = 'Use uv for Python packages.' "
+                "BEGIN SELECT RAISE(ABORT, 'backend unavailable'); END"
+            )
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        await self._feed(learner, failed, 3)
+        await self._feed(learner, saved, 3)
+        await learner.stop()
+        assert {content: meta["evidence_count"] for _, content, meta in _read_traffic_rows(db)} == {
+            saved: 3
+        }
+
+        with sqlite3.connect(db) as conn:
+            conn.execute("DROP TRIGGER reject_one_save")
+        restored = TrafficLearner(backend=backend, min_evidence=3)
+        await restored.start()
+        try:
+            await self._feed(restored, failed, 1)
+            await _wait_for_evidence(db, failed, 4)
+        finally:
+            await restored.stop()
+        assert {content: meta["evidence_count"] for _, content, meta in _read_traffic_rows(db)} == {
+            failed: 4,
+            saved: 3,
+        }
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_retries_a_failed_sql_update_without_losing_evidence(
+        self, tmp_path
+    ):
+        import sqlite3
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _ObservedBackend(db)
+        backend.fail_after_commit = True
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        reconciled = asyncio.Event()
+        bump = learner._bump_persisted_evidence
+
+        async def observed_bump(*args, **kwargs):
+            try:
+                return await bump(*args, **kwargs)
+            finally:
+                reconciled.set()
+
+        learner._bump_persisted_evidence = observed_bump
+        content = "Use uv for Python packages."
+        await learner.start()
+        try:
+            await self._feed(learner, content, 3)
+            await asyncio.wait_for(backend.attempted.wait(), 2)
+            committed = _read_traffic_rows(db)
+            assert len(committed) == 1
+            memory_id, _, metadata = committed[0]
+            h = metadata["content_hash"]
+            token = metadata["learner_save_token"]
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TRIGGER reject_update BEFORE UPDATE ON memories "
+                    "BEGIN SELECT RAISE(ABORT, 'backend unavailable'); END"
+                )
+            await self._feed(learner, content, 2)
+            await asyncio.wait_for(reconciled.wait(), 2)
+            rows = _read_traffic_rows(db)
+            assert len(rows) == 1
+            assert rows[0][0] == memory_id
+            assert rows[0][2]["evidence_count"] == 3
+            assert rows[0][2]["learner_saved_evidence"] == 3
+            assert learner._pattern_counts[h][1] == 5
+            assert learner._save_tokens[h] == token
+            assert h not in learner._saved_hashes
+
+            with sqlite3.connect(db) as conn:
+                conn.execute("DROP TRIGGER reject_update")
+            reconciled.clear()
+            await self._feed(learner, content, 1)
+            await asyncio.wait_for(reconciled.wait(), 2)
+            rows = _read_traffic_rows(db)
+            assert len(rows) == 1
+            assert rows[0][0] == memory_id
+            assert rows[0][2]["evidence_count"] == 6
+            assert rows[0][2]["learner_saved_evidence"] == 6
+            assert h in learner._saved_hashes
+            assert h not in learner._pattern_counts
+            assert h not in learner._save_tokens
+        finally:
+            await learner.stop()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_evidence_survives_best_effort_index_refresh_failure(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        content = "Use uv for Python packages."
+        await learner.start()
+        try:
+            await self._feed(learner, content, 3)
+            await _wait_for_saved(learner, 1, db)
+            committed = _read_traffic_rows(db)
+            assert len(committed) == 1
+            memory_id, _, metadata = committed[0]
+            h = metadata["content_hash"]
+
+            async def failing_refresh(memory_id):
+                raise RuntimeError("index unavailable")
+
+            backend.refresh_memory_indexes = failing_refresh
+            await self._feed(learner, content, 2)
+            rows = _read_traffic_rows(db)
+            assert len(rows) == 1
+            assert rows[0][0] == memory_id
+            assert rows[0][2]["evidence_count"] == 5
+            assert h in learner._saved_hashes
+            assert h not in learner._pattern_counts
+            assert h not in learner._save_tokens
+        finally:
+            await learner.stop()
+
+    @pytest.mark.asyncio
+    async def test_late_reconciliation_preserves_other_and_already_counted_sightings(
+        self, tmp_path
+    ):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        memory = await backend.save_memory(
+            content="Use uv for Python packages.",
+            user_id="default",
+            importance=0.7,
+            metadata={
+                "source": "traffic_learner",
+                "evidence_count": 3,
+                "learner_save_token": "save-attempt",
+                "learner_saved_evidence": 3,
+            },
+        )
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        await learner._bump_persisted_evidence(
+            memory.id, last_seen_at="2024-01-02T00:00:00+00:00", save_attempt=("save-attempt", 5)
+        )
+        await learner._bump_persisted_evidence(memory.id, last_seen_at="2024-01-04T00:00:00+00:00")
+        await learner._bump_persisted_evidence(
+            memory.id, last_seen_at="2024-01-03T00:00:00+00:00", save_attempt=("save-attempt", 6)
+        )
+        await learner._bump_persisted_evidence(
+            memory.id, last_seen_at="2024-01-02T00:00:00+00:00", save_attempt=("save-attempt", 5)
+        )
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][2]["evidence_count"] == 7
+        assert rows[0][2]["learner_saved_evidence"] == 6
+        assert rows[0][2]["last_seen_at"] == "2024-01-04T00:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_full_queue_preserves_evidence_for_a_later_sighting(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        learner = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        learner._save_queue = asyncio.Queue(maxsize=1)
+        await self._feed(learner, "Use uv for Python packages.", 3)
+        await self._feed(learner, "Keep pull request descriptions short.", 3)
+        await learner.start()
+        try:
+            await _wait_for_saved(learner, 1, db)
+            await self._feed(learner, "Keep pull request descriptions short.", 1)
+            await _wait_for_saved(learner, 2, db)
+        finally:
+            await learner.stop()
+        assert {content: meta["evidence_count"] for _, content, meta in _read_traffic_rows(db)} == {
+            "Use uv for Python packages.": 3,
+            "Keep pull request descriptions short.": 4,
+        }
+
+    @pytest.mark.asyncio
+    async def test_cancelled_save_survives_restart(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _ObservedBackend(db)
+        backend.release = asyncio.Event()
+        learner = TrafficLearner(backend=backend, min_evidence=3)
+        await learner.start()
+        await self._feed(learner, "Use uv for Python packages.", 3)
+        await asyncio.wait_for(backend.entered.wait(), 2)
+        await self._feed(learner, "Use uv for Python packages.", 2)
+        await learner.stop()
+        restarted = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await restarted.start()
+        try:
+            await self._feed(restarted, "Use uv for Python packages.", 1)
+            await _wait_for_saved(restarted, 1, db)
+        finally:
+            await restarted.stop()
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][2]["evidence_count"] == 6
+
+
+class TestUserScopedPersistence:
+    """Learners sharing one memory.db only read their own user's rows."""
+
+    @pytest.mark.asyncio
+    async def test_hydration_ignores_other_users_rows(self, tmp_path, monkeypatch):
+        import json
+        import sqlite3
+
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        (tmp_path / "home").mkdir()
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        content = "Use uv for Python packages."
+        await backend.save_memory(
+            content=content,
+            user_id="alice",
+            importance=0.7,
+            metadata={
+                "source": "traffic_learner",
+                "category": "preference",
+                "evidence_count": 3,
+                "last_seen_at": "2026-02-01T00:00:00+00:00",
+            },
+        )
+        learner = TrafficLearner(backend=backend, user_id="bob", min_evidence=3, dedup_window=1)
+        await learner.start()
+        try:
+            for _ in range(3):
+                await learner._accumulate(
+                    ExtractedPattern(
+                        category=PatternCategory.PREFERENCE, content=content, importance=0.7
+                    )
+                )
+            await _wait_for_saved(learner, 2, db)
+        finally:
+            await learner.stop()
+
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute("SELECT user_id, metadata FROM memories").fetchall()
+        evidence = {user_id: json.loads(meta)["evidence_count"] for user_id, meta in rows}
+        assert evidence == {"alice": 3, "bob": 3}
+
+    @pytest.mark.asyncio
+    async def test_collected_patterns_exclude_other_users(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        for user_id, content in (
+            ("alice", "Alice-only deployment procedure."),
+            ("bob", "Bob's package workflow."),
+        ):
+            await backend.save_memory(
+                content=content,
+                user_id=user_id,
+                importance=0.7,
+                metadata={
+                    "source": "traffic_learner",
+                    "category": "preference",
+                    "evidence_count": 5,
+                },
+            )
+
+        learner = TrafficLearner(backend=backend, user_id="bob")
+        contents = [p.content for p in learner._collect_all_patterns()]
+        assert contents == ["Bob's package workflow."]
+
+
 class TestEvidencePersistence:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("min_evidence", [1, 2, 5])
+    async def test_persists_at_configured_evidence_threshold(self, tmp_path, min_evidence):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        learner = TrafficLearner(backend=_FakeBackend(db), min_evidence=min_evidence)
+        await learner.start()
+        try:
+            for _ in range(min_evidence - 1):
+                await learner._accumulate(
+                    ExtractedPattern(
+                        category=PatternCategory.PREFERENCE,
+                        content="Use uv for Python packages.",
+                        importance=0.7,
+                    )
+                )
+            assert _read_traffic_rows(db) == []
+            await learner._accumulate(
+                ExtractedPattern(
+                    category=PatternCategory.PREFERENCE,
+                    content="Use uv for Python packages.",
+                    importance=0.7,
+                )
+            )
+            await _wait_for_saved(learner, 1, db)
+        finally:
+            await learner.stop()
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][1] == "Use uv for Python packages."
+        assert rows[0][2]["evidence_count"] == min_evidence
+
     @pytest.mark.asyncio
     async def test_save_persists_actual_evidence_count(self, tmp_path):
         """The count written to the DB reflects total sightings, not the default 1."""
@@ -1004,6 +1824,9 @@ def _install_plugin_registry(monkeypatch, plugin):
     fake.auto_detect_plugins = lambda: [plugin] if plugin is not None else []  # type: ignore[attr-defined]
     fake.get_plugin = lambda agent_type: plugin  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "headroom.learn.registry", fake)
+    import headroom.learn as learn_pkg
+
+    monkeypatch.setattr(learn_pkg, "registry", fake, raising=False)
 
 
 def _make_project(path):
@@ -1022,11 +1845,12 @@ class TestFlushToFile:
         db = tmp_path / "memory.db"
         _init_db(db)
         backend = _FakeBackend(db)
+        project_path = tmp_path.resolve()
 
         learner = TrafficLearner(backend=backend, agent_type="claude", min_evidence=2)
         writer = _FakeWriter()
-        writer.files_to_return = [tmp_path / "CLAUDE.md"]
-        proj = _make_project(str(tmp_path))
+        writer.files_to_return = [project_path / "CLAUDE.md"]
+        proj = _make_project(str(project_path))
         plugin = _FakePlugin(roots=[proj], writer=writer)
         _install_plugin_registry(monkeypatch, plugin)
 
@@ -1038,7 +1862,7 @@ class TestFlushToFile:
             def mk() -> ExtractedPattern:
                 return ExtractedPattern(
                     category=PatternCategory.ENVIRONMENT,
-                    content=f"Use /usr/bin/python3 at {tmp_path}/main.py",
+                    content=f"Use /usr/bin/python3 at {project_path}/main.py",
                     importance=0.6,
                 )
 
@@ -1135,10 +1959,51 @@ class TestFlushToFile:
         assert writer.calls == []  # no roots → short-circuits before writer
 
     @pytest.mark.asyncio
+    async def test_discover_projects_does_not_block_the_event_loop(self, tmp_path, monkeypatch):
+        """A slow discover_projects must not stall other loop work.
+
+        discover_projects walks the filesystem; on a large home tree it takes
+        minutes. Called inline it froze the loop, so uvicorn stopped answering
+        /readyz and supervisors killed a proxy that was only busy.
+        """
+        writer = _FakeWriter()
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
+
+        release = threading.Event()
+
+        def slow_discover():
+            release.wait(timeout=5)
+            return [_make_project(str(project_path))]
+
+        plugin.discover_projects = slow_discover  # type: ignore[method-assign]
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.ENVIRONMENT,
+                content=f"Working test command: cd {project_path} && pytest",
+                importance=0.5,
+                evidence_count=2,
+            ),
+            2,
+        )
+
+        flush = asyncio.create_task(learner.flush_to_file())
+        # The loop stays responsive while discover_projects is stuck.
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        assert not flush.done()
+        release.set()
+        await asyncio.wait_for(flush, timeout=5)
+        assert writer.calls, "flush should still complete once discovery returns"
+
+    @pytest.mark.asyncio
     async def test_unanchored_patterns_dropped(self, tmp_path, monkeypatch):
         """Patterns with no path anchoring are dropped before writer is called."""
         writer = _FakeWriter()
-        plugin = _FakePlugin(roots=[_make_project(str(tmp_path))], writer=writer)
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
         _install_plugin_registry(monkeypatch, plugin)
 
         learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
@@ -1160,14 +2025,15 @@ class TestFlushToFile:
         """A writer raising should be logged; flush must not bubble the error."""
         writer = _FakeWriter()
         writer.raise_on_write = True
-        plugin = _FakePlugin(roots=[_make_project(str(tmp_path))], writer=writer)
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
         _install_plugin_registry(monkeypatch, plugin)
 
         learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
         learner._pattern_counts["h"] = (
             ExtractedPattern(
                 category=PatternCategory.ENVIRONMENT,
-                content=f"Use {tmp_path}/tool.py",
+                content=f"Use {project_path}/tool.py",
                 importance=0.6,
                 evidence_count=2,
             ),
@@ -1226,7 +2092,7 @@ class TestCollectAllPatterns:
             },
         )
 
-        learner = TrafficLearner(backend=backend, min_evidence=1)
+        learner = TrafficLearner(backend=backend, user_id="t", min_evidence=1)
         # Same content in accumulator with count=2; hash matches.
         p = ExtractedPattern(
             category=PatternCategory.ENVIRONMENT,
@@ -1268,6 +2134,91 @@ class TestHydrateEdgeCases:
         assert learner._saved_hashes == set()
         assert learner._persisted_ids == {}
 
+    @pytest.mark.asyncio
+    async def test_unreadable_db_warns_on_hydration(self, tmp_path):
+        """A memory.db that cannot be read must say so; a missing one stays quiet."""
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        logger = logging.getLogger("headroom.memory.traffic_learner")
+        logger.addHandler(handler)
+        try:
+            await TrafficLearner(
+                backend=_FakeBackend(tmp_path / "not-there.db"), min_evidence=1
+            )._hydrate_persisted_state()
+            assert [r for r in records if r.levelno >= logging.WARNING] == []
+
+            bad = tmp_path / "memory.db"
+            bad.write_bytes(b"this is not a sqlite database" * 100)
+            learner = TrafficLearner(backend=_FakeBackend(bad), min_evidence=1)
+            await learner._hydrate_persisted_state()
+            warnings = [r for r in records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert "hydrate" in warnings[0].getMessage()
+            assert str(bad) in warnings[0].getMessage()
+            assert learner._saved_hashes == set()
+        finally:
+            logger.removeHandler(handler)
+
+    @pytest.mark.asyncio
+    async def test_hydration_is_bounded_to_dedup_window(self, tmp_path):
+        """A persisted history larger than dedup_window must not start the
+        in-memory dedup maps oversized. Hydration keeps at most dedup_window
+        rows (the most-recently-seen), and both maps stay bounded with matching
+        keys — otherwise a long-lived install boots with an unbounded leak that
+        only trims one entry at a time."""
+        import json as _json
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        window = 5
+        total = 20
+        conn = _sql.connect(db)
+        try:
+            for i in range(total):
+                conn.execute(
+                    "INSERT INTO memories (id, content, metadata, entity_refs, importance) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        f"id-{i:02d}",
+                        f"Command `cmd{i}` fails; use `alt{i}` instead.",
+                        _json.dumps(
+                            {
+                                "source": "traffic_learner",
+                                "category": "error_recovery",
+                                "evidence_count": 2,
+                                # Higher i == more recently seen; hydration keeps
+                                # the newest `window` of these.
+                                "last_seen_at": f"2026-01-01T00:{i:02d}:00+00:00",
+                            }
+                        ),
+                        "[]",
+                        0.7,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=2, dedup_window=window)
+        await learner._hydrate_persisted_state()
+
+        # Both maps are bounded to the window and hold exactly the same keys.
+        assert len(learner._saved_hashes) <= window
+        assert len(learner._persisted_ids) <= window
+        assert set(learner._persisted_ids) == set(learner._saved_hashes)
+        # The retained rows are the most-recently-seen ones (ids 15..19).
+        assert set(learner._persisted_ids.values()) == {f"id-{i:02d}" for i in range(15, 20)}
+
 
 class TestBumpEdgeCases:
     @pytest.mark.asyncio
@@ -1291,6 +2242,7 @@ class TestBumpEdgeCases:
         learner = TrafficLearner(backend=backend, min_evidence=1)
         await learner._bump_persisted_evidence("no-such-id")
         assert _read_traffic_rows(db) == []
+        assert backend.refreshed_ids == []
 
 
 # =============================================================================
@@ -1663,7 +2615,15 @@ class TestNormalizeBashForHash:
 
     def test_cuts_at_first_chain(self):
         # && boundary collapses to just the primary command
-        assert _normalize_bash_for_hash("cd /tmp && ls") == "cd /tmp"
+        assert _normalize_bash_for_hash("make build && ls") == "make build"
+
+    def test_strips_leading_cd(self):
+        # A `cd` prefix is not the primary command; keeping it collapsed every
+        # cd-prefixed recovery in a project onto one hash key.
+        assert _normalize_bash_for_hash("cd /tmp && ls") == "ls"
+        assert _normalize_bash_for_hash('cd "C:\\a b"; cd sub && cargo check') == "cargo check"
+        assert _normalize_bash_for_hash(r"cd /home/dev/my\ project && cargo check") == "cargo check"
+        assert _normalize_bash_for_hash("cd /tmp") == "cd /tmp"
 
 
 class TestParseIsoTimestamp:
@@ -1705,6 +2665,7 @@ class TestLoadPersistedPatternsTimestamps:
         conn.execute(
             "CREATE TABLE memories ("
             "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "user_id TEXT NOT NULL DEFAULT 'default', "
             "metadata TEXT NOT NULL DEFAULT '{}', "
             "entity_refs TEXT NOT NULL DEFAULT '[]', "
             "importance REAL NOT NULL DEFAULT 0.5, "
@@ -1744,7 +2705,7 @@ class TestLoadPersistedPatternsTimestamps:
                 }
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         p = patterns[0]
         assert p.first_seen_at is not None
@@ -1768,7 +2729,7 @@ class TestLoadPersistedPatternsTimestamps:
                 }
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].first_seen_at is not None
         assert patterns[0].first_seen_at.month == 3
@@ -1804,7 +2765,7 @@ class TestLoadPersistedPatternsTimestamps:
                 },
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         p = patterns[0]
         assert p.evidence_count == 5
@@ -1823,6 +2784,7 @@ class TestLoadPersistedPatternsTimestamps:
         conn.execute(
             "CREATE TABLE memories ("
             "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "user_id TEXT NOT NULL DEFAULT 'default', "
             "metadata TEXT NOT NULL DEFAULT '{}', "
             "entity_refs TEXT NOT NULL DEFAULT '[]', "
             "importance TEXT, "
@@ -1845,7 +2807,7 @@ class TestLoadPersistedPatternsTimestamps:
         )
         conn.commit()
         conn.close()
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].importance == 0.5
 
@@ -1858,6 +2820,7 @@ class TestLoadPersistedPatternsTimestamps:
         conn.execute(
             "CREATE TABLE memories ("
             "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "user_id TEXT NOT NULL DEFAULT 'default', "
             "metadata TEXT NOT NULL DEFAULT '{}', "
             "entity_refs TEXT NOT NULL DEFAULT '[]', "
             "importance REAL NOT NULL DEFAULT 0.5, "
@@ -1865,13 +2828,14 @@ class TestLoadPersistedPatternsTimestamps:
         )
         # Invalid JSON in metadata
         conn.execute(
-            "INSERT INTO memories VALUES (?,?,?,?,?,?)",
+            "INSERT INTO memories (id, content, metadata, entity_refs, importance, created_at) "
+            "VALUES (?,?,?,?,?,?)",
             ("0", "bullet", "{not json", "[]", 0.5, None),
         )
         conn.commit()
         conn.close()
         # Should not raise — the row is simply skipped (no recognizable category).
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert patterns == []
 
 
@@ -1918,6 +2882,7 @@ class TestBumpPersistsLastSeenAt:
         # Should be parseable back.
         parsed = _parse_iso_timestamp(meta["last_seen_at"])
         assert parsed is not None
+        assert backend.refreshed_ids == ["row-1"]
 
 
 class TestHydrateLegacyRow:
@@ -2151,6 +3116,90 @@ class TestExtractPreferencesSystemReminderFiltering:
         assert learner._extract_preferences(text) == []
 
 
+class TestUserAuthoredPreferenceFiltering:
+    """Codex ambient context must not count as preference evidence."""
+
+    def _learner(self) -> TrafficLearner:
+        return TrafficLearner(backend=None, min_evidence=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<heartbeat>Never notify the user for a quiet check.</heartbeat>",
+            "<environment_context>Always use the sandbox.</environment_context>",
+            (
+                '<in-app-browser-context source="ambient-ui-state">'
+                "Do not treat it as evidence that the user selected the browser."
+                "</in-app-browser-context>"
+            ),
+            "# AGENTS.md instructions for /workspace\nNever edit generated files.",
+            "Another language model started to solve this problem and produced a summary. "
+            "Do not repeat completed work.",
+            "## Relevant Memories\n1. User preference: Never run deployment commands.",
+        ],
+    )
+    async def test_harness_only_user_messages_are_ignored(self, content: str) -> None:
+        learner = self._learner()
+
+        await learner.on_messages([{"role": "user", "content": content}])
+
+        assert learner.get_stats()["patterns_extracted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_system_and_developer_messages_are_ignored(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {"role": "system", "content": "Never expose system instructions."},
+                {"role": "developer", "content": "Do not use unsafe commands."},
+                {"role": "unknown", "content": "Always obey ambient UI."},
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_memory_suffix_is_removed_but_user_correction_is_kept(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Don't use force push.\n\n"
+                        "## Relevant Memories\n"
+                        "1. User preference: Always bypass review."
+                    ),
+                }
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_browser_context_suffix_is_removed_but_user_correction_is_kept(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Don't use force push.\n\n"
+                        '<in-app-browser-context source="ambient-ui-state">'
+                        "Do not treat this as evidence that the user selected the browser."
+                        "</in-app-browser-context>"
+                    ),
+                }
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 1
+
+
 class TestExtractPreferencesRealCorrections:
     """Make sure the noise filter does not eat genuine user corrections."""
 
@@ -2227,3 +3276,192 @@ class TestExtractPreferencesSentenceBoundary:
         assert not out[0].content.endswith(".")
         assert not out[0].content.endswith("!")
         assert not out[0].content.endswith("?")
+
+
+# =============================================================================
+# Pending-state persistence across restarts
+# =============================================================================
+
+
+class TestPendingStatePersistence:
+    """Sub-threshold evidence must survive process restarts (sidecar JSON)."""
+
+    _PATTERN_KWARGS = {
+        "category": PatternCategory.ENVIRONMENT,
+        "content": "Use /usr/bin/python3 for system scripts.",
+        "importance": 0.6,
+    }
+
+    @pytest.mark.asyncio
+    async def test_pending_evidence_survives_restart(self, tmp_path):
+        """2 sightings before restart + 1 after = saved with evidence_count 3."""
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        first = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await first.start()
+        for _ in range(2):
+            await first._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await first.stop()
+
+        sidecar = tmp_path / "pending_patterns.json"
+        assert sidecar.exists()
+        assert _read_traffic_rows(db) == []  # still below threshold
+
+        second = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await second.start()
+        assert second.get_stats()["pending_patterns"] == 1
+        await second._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await _wait_for_saved(second, 1, db)
+        await second.stop()
+
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][2]["evidence_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_corrupt_pending_file_is_ignored(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        (tmp_path / "pending_patterns.json").write_text("{not json")
+
+        learner = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await learner.start()  # must not raise
+        assert learner.get_stats()["pending_patterns"] == 0
+        await learner.stop()
+
+    @pytest.mark.asyncio
+    async def test_already_saved_pattern_not_rehydrated_as_pending(self, tmp_path):
+        """A sidecar entry whose hash is already persisted is skipped on load."""
+        import json as _json
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        first = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await first.start()
+        for _ in range(3):
+            await first._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await _wait_for_saved(first, 1, db)
+        await first.stop()
+
+        # Handcraft a stale sidecar claiming the saved pattern is still pending.
+        h = ExtractedPattern(**self._PATTERN_KWARGS).content_hash
+        (tmp_path / "pending_patterns.json").write_text(
+            _json.dumps(
+                {
+                    "version": 1,
+                    "patterns": [
+                        {
+                            "category": "environment",
+                            "content": self._PATTERN_KWARGS["content"],
+                            "importance": 0.6,
+                            "count": 2,
+                            "entity_refs": [],
+                            "metadata": {},
+                            "content_hash": h,
+                        }
+                    ],
+                }
+            )
+        )
+
+        second = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await second.start()
+        assert second.get_stats()["pending_patterns"] == 0
+        await second.stop()
+
+
+def test_long_commands_skip_the_quadratic_edit_distance(monkeypatch):
+    """#4367: commands past the cap are judged without _levenshtein."""
+    import headroom.memory.traffic_learner as tl
+
+    real = tl._levenshtein
+
+    def _guarded(a, b):
+        # binary-name matching may still use it on short names
+        if max(len(a), len(b)) > tl._RETRY_EDIT_DISTANCE_MAX_CHARS:
+            raise AssertionError("edit distance computed on an oversized command")
+        return real(a, b)
+
+    monkeypatch.setattr(tl, "_levenshtein", _guarded)
+    body = "x" * (tl._RETRY_EDIT_DISTANCE_MAX_CHARS + 1)
+    # shared substantive token -> still related, via the linear path
+    assert tl._commands_related_as_retry(f"python {body} run", f"python3 {body} run")
+    # no shared substantive token -> unrelated
+    assert not tl._commands_related_as_retry(f"python {body}", "python other.py")
+
+
+def test_short_commands_still_use_edit_distance():
+    """Commands within the cap keep the existing edit-distance behaviour."""
+    assert _commands_related_as_retry("cargo build", "cargo build --release")
+
+
+def _record_oversized_levenshtein(monkeypatch):
+    """Wrap _levenshtein and record every call on an input past the cap."""
+    import headroom.memory.traffic_learner as tl
+
+    real = tl._levenshtein
+    oversized: list[tuple[int, int]] = []
+
+    def _recording(a, b):
+        if max(len(a), len(b)) > tl._RETRY_EDIT_DISTANCE_MAX_CHARS:
+            oversized.append((len(a), len(b)))
+        return real(a, b)
+
+    monkeypatch.setattr(tl, "_levenshtein", _recording)
+    return oversized
+
+
+def test_oversized_first_token_skips_the_quadratic_edit_distance(monkeypatch):
+    """Review of #4371: a long executable token must not reach _levenshtein either."""
+    import headroom.memory.traffic_learner as tl
+
+    oversized = _record_oversized_levenshtein(monkeypatch)
+    head = "x" * 2000
+    # the first tokens (2000 and 2001 chars) are prefix-related; "execute" is shared
+    assert tl._commands_related_as_retry(f"{head} execute", f"{head}3 execute")
+    assert tl._bash_binaries_match(head, f"{head}3")
+    assert not tl._bash_binaries_match(head, f"{head}333")
+    assert oversized == []
+
+
+def test_short_binary_names_keep_the_prefix_tolerance():
+    assert _bash_binaries_match("python", "python3")
+    assert _bash_binaries_match("python3", "python")
+    assert _bash_binaries_match("python", "python32")
+    assert not _bash_binaries_match("python", "python321")
+    assert not _bash_binaries_match("pyth", "python3")
+
+
+@pytest.mark.asyncio
+async def test_oversized_first_token_through_on_tool_result(monkeypatch):
+    """Same case through the entry point the proxy handlers await."""
+    oversized = _record_oversized_levenshtein(monkeypatch)
+    learner = TrafficLearner(backend=None, user_id="test-user", min_evidence=1)
+    head = "x" * 2000
+    await learner.on_tool_result(
+        tool_name="Bash",
+        tool_input={"command": f"{head} execute"},
+        tool_output="Error: execute failed with status 2",
+        is_error=True,
+    )
+    await learner.on_tool_result(
+        tool_name="Bash",
+        tool_input={"command": f"{head}3 execute"},
+        tool_output="done",
+        is_error=False,
+    )
+    assert oversized == []
+    assert learner.get_stats()["patterns_extracted"] >= 1
+
+
+def test_oversized_path_basename_skips_the_quadratic_edit_distance(monkeypatch):
+    """The file-path typo check runs the same edit distance on traffic basenames."""
+    import headroom.memory.traffic_learner as tl
+
+    oversized = _record_oversized_levenshtein(monkeypatch)
+    name = "y" * 2000
+    assert not tl._paths_related_as_typo(f"/a/{name}.rs", f"/a/{name}x.rs")
+    assert tl._paths_related_as_typo("/a/staet.rs", "/a/state.rs")
+    assert oversized == []

@@ -1,5 +1,14 @@
 """Copilot-specific provider helpers."""
 
+from .vscode import (
+    configure_vscode_proxy_settings,
+    copilot_harness_settings_enabled,
+    remove_vscode_proxy_settings,
+    unrouted_vscode_profiles,
+    vscode_proxy_url,
+    vscode_settings_path,
+    vscode_user_dir,
+)
 from .wrap import (
     build_launch_env,
     copilot_model_from_args,
@@ -28,4 +37,11 @@ __all__ = [
     "resolve_provider_type",
     "strip_auto_model_args",
     "validate_configuration",
+    "configure_vscode_proxy_settings",
+    "copilot_harness_settings_enabled",
+    "remove_vscode_proxy_settings",
+    "unrouted_vscode_profiles",
+    "vscode_proxy_url",
+    "vscode_settings_path",
+    "vscode_user_dir",
 ]

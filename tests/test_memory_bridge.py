@@ -8,7 +8,9 @@ Run with: pytest tests/test_memory_bridge.py -v
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import uuid
 
 import pytest
@@ -24,6 +26,7 @@ from headroom.memory.bridge_parsers import (
     parse_generic_markdown,
     parse_markdown,
 )
+from tests._skip_helpers import external_model_skip_reason
 
 # Sample content for testing
 CLAUDE_CODE_MEMORY = """\
@@ -61,6 +64,40 @@ The system uses FastAPI for the proxy layer.
 - Add caching layer
 - Improve error handling
 """
+
+
+def skip_offline_model_failures(func):
+    """Skip bridge integration tests when the local embedder cannot start offline."""
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as exc:
+            reason = external_model_skip_reason(exc)
+            if reason is not None:
+                pytest.skip(reason)
+            raise
+
+    return wrapper
+
+
+def decorate_async_test_methods(cls):
+    """Wrap every async test method on a class with the offline-model skip helper."""
+    for name, value in vars(cls).items():
+        if name.startswith("test_"):
+            setattr(cls, name, skip_offline_model_failures(value))
+    return cls
+
+
+def skip_if_offline_bridge_import_failed(stats) -> None:
+    """Skip bridge assertions when every section failed only because the model cache is offline."""
+    if (
+        os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+        and stats.sections_imported == 0
+        and stats.sections_failed > 0
+    ):
+        pytest.skip("Skipped because required Hugging Face model files are unavailable offline")
 
 
 # =============================================================================
@@ -225,6 +262,59 @@ class TestRelationshipExtraction:
         uses_rels = [r for r in rels if r["relationship"] == "uses"]
         assert len(uses_rels) >= 1
 
+    def test_verb_patterns_still_match_with_long_words(self):
+        """Words up to the bound keep matching normally."""
+        section = ParsedSection(
+            heading="Test",
+            heading_level=2,
+            content="Aaa64 uses Bbb64",
+            facts=[],
+        )
+        rels = extract_relationships_from_section(section)
+        uses_rels = [r for r in rels if r["relationship"] == "uses"]
+        assert uses_rels and uses_rels[0]["source"] == "Aaa64"
+        assert uses_rels[0]["destination"] == "Bbb64"
+
+    def test_long_token_is_linear_not_quadratic(self):
+        """A single long token must not stall relationship extraction (#4370).
+
+        Before the word-boundary anchor, the four verb patterns each
+        backtracked O(n^2) over a long word run (an 8k-char token took
+        seconds). The anchor keeps the scan linear.
+        """
+        import time
+
+        long_token = "a" * 20000
+        section = ParsedSection(
+            heading="Test",
+            heading_level=2,
+            content=f"{long_token}\nHeadroom uses SQLite for storage",
+            facts=[],
+        )
+        start = time.monotonic()
+        rels = extract_relationships_from_section(section)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, f"extraction took {elapsed:.1f}s on one long token"
+        uses_rels = [r for r in rels if r["relationship"] == "uses"]
+        assert any(
+            "Headroom" in r["source"] and r["destination"].split()[0] == "SQLite" for r in uses_rels
+        )
+
+    def test_long_names_bind_whole(self):
+        """A name longer than 64 characters binds whole, not as a 64-char slice."""
+        long_src = "A" * 70
+        long_dst = "B" * 72
+        section = ParsedSection(
+            heading="Test",
+            heading_level=2,
+            content=f"{long_src} uses {long_dst}",
+            facts=[],
+        )
+        rels = extract_relationships_from_section(section)
+        uses_rels = [r for r in rels if r["relationship"] == "uses"]
+        assert uses_rels and uses_rels[0]["source"] == long_src
+        assert uses_rels[0]["destination"] == long_dst
+
 
 # =============================================================================
 # Bridge Tests (require backend)
@@ -273,6 +363,7 @@ def bridge(bridge_config, backend):
     return MemoryBridge(bridge_config, backend)
 
 
+@decorate_async_test_methods
 class TestMemoryBridgeImport:
     @pytest.mark.asyncio
     async def test_import_claude_code_memory(self, bridge, tmp_dir, backend):
@@ -281,6 +372,7 @@ class TestMemoryBridgeImport:
         md_path.write_text(CLAUDE_CODE_MEMORY, encoding="utf-8")
 
         stats = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats)
 
         assert stats.files_processed == 1
         assert stats.sections_imported > 0
@@ -297,6 +389,7 @@ class TestMemoryBridgeImport:
         md_path.write_text(CLAUDE_CODE_MEMORY, encoding="utf-8")
 
         stats1 = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats1)
         assert stats1.sections_imported > 0
 
         stats2 = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
@@ -316,6 +409,7 @@ class TestMemoryBridgeImport:
         md_path.write_text(modified, encoding="utf-8")
 
         stats = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats)
         assert stats.files_processed == 1
         assert stats.sections_imported >= 1  # At least the new section
 
@@ -339,6 +433,7 @@ class TestMemoryBridgeImport:
 
         bridge._config.md_format = MarkdownFormat.CHATGPT
         stats = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats)
         assert stats.sections_imported > 0
 
     @pytest.mark.asyncio
@@ -366,6 +461,7 @@ class TestMemoryBridgeImport:
             assert "source_file" in metadata
 
 
+@decorate_async_test_methods
 class TestMemoryBridgeExport:
     @pytest.mark.asyncio
     async def test_export_claude_code_style(self, bridge, tmp_dir, backend):
@@ -422,6 +518,7 @@ class TestMemoryBridgeExport:
         assert "No memories" in markdown
 
 
+@decorate_async_test_methods
 class TestMemoryBridgeSync:
     @pytest.mark.asyncio
     async def test_sync_imports_and_exports(self, bridge, tmp_dir, backend):
@@ -432,6 +529,7 @@ class TestMemoryBridgeSync:
 
         # First sync: imports from file
         stats = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats.import_stats)
         assert stats.import_stats.sections_imported > 0
 
         # Add an organic memory (not from bridge)
@@ -465,6 +563,7 @@ class TestMemoryBridgeSync:
         assert stats.memories_exported == 0
 
 
+@decorate_async_test_methods
 class TestSyncStatePersistence:
     @pytest.mark.asyncio
     async def test_state_saved_and_loaded(self, tmp_dir, backend):
@@ -496,6 +595,7 @@ class TestSyncStatePersistence:
         assert stats.files_skipped_unchanged == 1
 
 
+@decorate_async_test_methods
 class TestRoundTrip:
     @pytest.mark.asyncio
     async def test_import_export_preserves_facts(self, bridge, tmp_dir, backend):

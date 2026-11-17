@@ -28,7 +28,8 @@ def client():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as client:
+    # CCR endpoints are loopback-gated (#1227).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         yield client
     reset_compression_store()
 
@@ -108,62 +109,6 @@ class TestCCRRetrieveEndpoint:
         assert len(retrieved_items) == 50
         assert retrieved_items[0]["id"] == 0
 
-    def test_retrieve_with_search(self, client):
-        """Search retrieval filters by query."""
-        store = get_compression_store()
-        items = [
-            {"id": 1, "text": "Python programming language"},
-            {"id": 2, "text": "JavaScript web development"},
-            {"id": 3, "text": "Python data science"},
-            {"id": 4, "text": "Java enterprise"},
-        ]
-        hash_key = store.store(
-            original=json.dumps(items),
-            compressed="[]",
-            original_item_count=4,
-            compressed_item_count=0,
-        )
-
-        response = client.post(
-            "/v1/retrieve", json={"hash": hash_key, "query": "Python programming"}
-        )
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["hash"] == hash_key
-        assert data["query"] == "Python programming"
-        assert "results" in data
-        assert data["count"] >= 1
-
-    def test_retrieve_with_search_plain_text_original(self, client):
-        """Query retrieval searches plain-text originals stored by Kompress."""
-        store = get_compression_store()
-        original = (
-            "Codex WS compression stores plain text originals. "
-            "The target symbol is _compress_openai_responses_payload."
-        )
-        hash_key = store.store(original=original, compressed="compressed")
-
-        response = client.post(
-            "/v1/retrieve",
-            json={"hash": hash_key, "query": "_compress_openai_responses_payload"},
-        )
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["hash"] == hash_key
-        assert data["count"] == 1
-        assert data["results"][0]["type"] == "text"
-        assert "_compress_openai_responses_payload" in data["results"][0]["text"]
-
-    def test_retrieve_with_search_nonexistent_hash_returns_404(self, client):
-        """Query mode should not mask a missing hash as an empty search."""
-        response = client.post(
-            "/v1/retrieve",
-            json={"hash": "nonexistent123", "query": "anything"},
-        )
-        assert response.status_code == 404
-
     def test_retrieve_increments_count(self, client):
         """Each retrieval increments the retrieval count."""
         store = get_compression_store()
@@ -204,47 +149,6 @@ class TestCCRRetrieveGetEndpoint:
         assert data["hash"] == hash_key
         assert data["original_item_count"] == 20
         assert data["tool_name"] == "get_test_tool"
-
-    def test_get_retrieve_with_query(self, client):
-        """GET retrieval with query parameter invokes search."""
-        store = get_compression_store()
-        # Create items with distinctive content
-        items = [
-            {"id": 1, "msg": "Python programming language tutorial for beginners"},
-            {"id": 2, "msg": "JavaScript web development framework guide"},
-            {"id": 3, "msg": "Python data science machine learning pandas"},
-            {"id": 4, "msg": "Java enterprise application development"},
-        ]
-        hash_key = store.store(
-            original=json.dumps(items),
-            compressed="[]",
-        )
-
-        response = client.get(f"/v1/retrieve/{hash_key}?query=Python programming")
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["query"] == "Python programming"
-        # Response includes search results structure
-        assert "results" in data
-        assert "count" in data
-        # Results should be a list (may be empty if BM25 threshold not met)
-        assert isinstance(data["results"], list)
-
-    def test_get_retrieve_with_query_plain_text_original(self, client):
-        """GET query retrieval searches plain-text originals."""
-        store = get_compression_store()
-        hash_key = store.store(
-            original="plain text contains _compress_openai_responses_payload",
-            compressed="plain text",
-        )
-
-        response = client.get(f"/v1/retrieve/{hash_key}?query=_compress_openai_responses_payload")
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["count"] == 1
-        assert data["results"][0]["type"] == "text"
 
     def test_get_retrieve_nonexistent(self, client):
         """GET with nonexistent hash returns 404."""
@@ -297,7 +201,6 @@ class TestCCRStatsEndpoint:
 
         store = get_compression_store()
 
-        # Use non-empty content so search actually logs
         content = json_module.dumps(
             [
                 {"id": "1", "name": "test item", "value": 100},
@@ -310,9 +213,9 @@ class TestCCRStatsEndpoint:
             tool_name="stats_test_tool",
         )
 
-        # Make some retrievals
-        client.post("/v1/retrieve", json={"hash": hash_key})  # Full retrieval
-        client.post("/v1/retrieve", json={"hash": hash_key, "query": "test"})  # Search retrieval
+        # Make some retrievals (retrieval is by hash → always full)
+        client.post("/v1/retrieve", json={"hash": hash_key})
+        client.post("/v1/retrieve", json={"hash": hash_key})
 
         response = client.get("/v1/retrieve/stats")
         assert response.status_code == 200
@@ -321,10 +224,10 @@ class TestCCRStatsEndpoint:
         assert data["store"]["total_retrievals"] >= 2
         assert len(data["recent_retrievals"]) >= 2
 
-        # Verify we have both retrieval types (no double-logging of full)
+        # All retrievals are full (no double-logging)
         retrieval_types = [r["retrieval_type"] for r in data["recent_retrievals"]]
         assert "full" in retrieval_types
-        assert "search" in retrieval_types
+        assert all(rt == "full" for rt in retrieval_types)
 
 
 class TestCCRIntegration:
@@ -373,19 +276,6 @@ class TestCCREdgeCases:
 
         data = response.json()
         assert data["original_item_count"] == 1000
-
-    def test_search_no_matches(self, client):
-        """Search with no matches returns empty results."""
-        store = get_compression_store()
-        items = [{"id": 1, "text": "hello world"}]
-        hash_key = store.store(original=json.dumps(items), compressed="[]")
-
-        response = client.post("/v1/retrieve", json={"hash": hash_key, "query": "xyznonexistent"})
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["count"] == 0
-        assert data["results"] == []
 
     def test_unicode_content(self, client):
         """Unicode content is handled correctly."""
@@ -453,7 +343,8 @@ class TestEndToEndTOINIntegration:
             cost_tracking_enabled=False,
         )
         app = create_app(config)
-        with TestClient(app) as client:
+        # CCR endpoints are loopback-gated (#1227).
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
             yield client
         reset_compression_store()
 
@@ -472,15 +363,14 @@ class TestEndToEndTOINIntegration:
         from headroom.telemetry import ToolSignature
         from headroom.transforms import SmartCrusher, TransformPipeline
 
-        # Create tool output with 100 items that will trigger compression
-        # Key: score field with varying values signals sortable data
-        # Having repetitive category values helps trigger compression
+        # Duplicate ranked rows require real keep/drop compression, so
+        # recording TOIN and caching originals cannot pass on JSON formatting.
         items = [
             {
-                "id": i,
-                "score": 1000 - i,  # Decreasing scores signal sorting
-                "category": f"cat_{i % 3}",  # Only 3 unique categories
-                "status": "active" if i % 2 == 0 else "inactive",  # Binary status
+                "id": i % 5,
+                "score": 1000 - (i % 5),
+                "category": f"cat_{i % 5}",
+                "status": "active",
             }
             for i in range(100)
         ]
@@ -543,40 +433,26 @@ class TestEndToEndTOINIntegration:
             model_limit=200000,
         )
 
-        # Verify SmartCrusher was invoked (transform name starts with smart_crush)
-        smart_crush_applied = any(
-            t.startswith("smart_crush") or t.startswith("smart:") for t in result.transforms_applied
-        )
-        assert smart_crush_applied, (
-            f"SmartCrusher should be in transforms: {result.transforms_applied}"
-        )
+        output = result.messages[2]["content"][0]["content"]
+        # The pipeline appends its retrieval notice after the JSON payload.
+        compressed, _ = json.JSONDecoder().raw_decode(output)
+        kept = [row for row in compressed if "id" in row]
+        assert len(kept) < len(items)
+        assert all(row in items for row in kept)
 
-        # Check if compression was actually performed (not skipped)
-        # Skip messages look like "smart:skip:reason(100->100)"
-        compression_was_skipped = any(
-            "skip" in t.lower() for t in result.transforms_applied if "smart:" in t.lower()
-        )
+        store = get_compression_store()
+        marker_text = compressed[-1]["_ccr_dropped"]
+        ccr_hash = marker_text[len("<<ccr:") :].split(" ", 1)[0]
+        entry = store.retrieve(ccr_hash)
+        assert entry is not None, "The rendered CCR marker must be retrievable"
+        assert json.loads(entry.original_content) == items
 
-        # If compression happened, verify TOIN and store
-        if not compression_was_skipped:
-            # Verify compression store has the entry
-            store = get_compression_store()
-            stats = store.get_stats()
-            assert stats["entry_count"] >= 1, "Should have cached entry"
-
-            # Verify TOIN recorded the compression
-            signature = ToolSignature.from_items(items)
-            pattern = fresh_toin._patterns.get(signature.structure_hash)
-            assert pattern is not None, (
-                "TOIN should have recorded compression event. "
-                "If this fails, SmartCrusher is not calling TOIN.record_compression."
-            )
-            assert pattern.total_compressions >= 1, "Should have at least 1 compression"
-        else:
-            # Compression was skipped - this is expected for some data patterns
-            # The important thing is that SmartCrusher was invoked and made a decision
-            # The other tests verify the full loop when compression does happen
-            pass
+        signature = ToolSignature.from_items(items)
+        pattern = fresh_toin.get_pattern(signature.structure_hash)
+        assert pattern is not None, "TOIN should have recorded the real compression"
+        assert pattern.total_compressions == 1
+        assert pattern.total_items_seen == len(items)
+        assert pattern.total_items_kept == len(kept)
 
     def test_retrieval_through_proxy_updates_toin_field_semantics(
         self, fresh_toin, client_with_optimization
@@ -638,9 +514,10 @@ class TestEndToEndTOINIntegration:
         store = get_compression_store()
         store.process_pending_feedback()
 
-        # PR-B5: pattern key is now `(auth_mode, model_family, sig_hash)`.
-        # Callers that don't supply auth/model land on the
-        # `("unknown", "unknown", sig_hash)` slot.
+        # PR-B5 + PR-F3: pattern key is now `(tenant_key, auth_mode,
+        # model_family, sig_hash)`. Callers that don't supply
+        # tenant/auth/model land on the
+        # `("global", "unknown", "unknown", sig_hash)` slot.
         from headroom.telemetry.toin import _make_pattern_key
 
         pattern = fresh_toin._patterns.get(_make_pattern_key(None, None, signature.structure_hash))
@@ -705,10 +582,10 @@ class TestEndToEndTOINIntegration:
                 strategy="smart_sample",
             )
 
-        # Step 2: Retrieve through proxy endpoint
+        # Step 2: Retrieve through proxy endpoint (by hash → full content)
         response = client_with_optimization.post(
             "/v1/retrieve",
-            json={"hash": hash_key, "query": "category:cat_1"},
+            json={"hash": hash_key},
         )
         assert response.status_code == 200
 
@@ -716,9 +593,10 @@ class TestEndToEndTOINIntegration:
         store.process_pending_feedback()
 
         # Step 3: Verify TOIN learned
-        # PR-B5: pattern key is now `(auth_mode, model_family, sig_hash)`.
-        # Callers that don't supply auth/model land on the
-        # `("unknown", "unknown", sig_hash)` slot.
+        # PR-B5 + PR-F3: pattern key is now `(tenant_key, auth_mode,
+        # model_family, sig_hash)`. Callers that don't supply
+        # tenant/auth/model land on the
+        # `("global", "unknown", "unknown", sig_hash)` slot.
         from headroom.telemetry.toin import _make_pattern_key
 
         pattern = fresh_toin._patterns.get(_make_pattern_key(None, None, signature.structure_hash))

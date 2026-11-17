@@ -132,20 +132,37 @@ def _load_sync_state(state_path: Path) -> dict[str, Any]:
 
 
 def _save_sync_state(state_path: Path, state: dict[str, Any]) -> None:
-    """Save sync state to disk."""
+    """Save sync state to disk (skipped in stateless mode)."""
+    if not _paths.persistence_allowed("memory sync state"):
+        return
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8", newline="\n")
 
 
 def _db_fingerprint(memories: list[Any]) -> str:
-    """Compute a fast fingerprint of DB state."""
+    """Fingerprint the fields that affect sync for every returned memory."""
     if not memories:
         return "empty"
-    # Hash: count + most recent created_at
-    parts = [str(len(memories))]
-    for m in memories[:5]:  # Sample first 5 for speed
-        parts.append(getattr(m, "id", "")[:8])
-    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    # IDs and row count stay unchanged on in-place edits. Sampling also misses
+    # changes outside the newest rows. Hash the already-fetched snapshot using
+    # the content and export/lineage fields, without volatile access counters.
+    rows = []
+    for memory in memories:
+        meta = memory.metadata or {}
+        rows.append(
+            (
+                memory.id,
+                memory.content,
+                getattr(memory, "category", "") or "",
+                getattr(memory, "importance", 0.5),
+                str(memory.created_at),
+                meta.get("source_agent", "unknown"),
+                meta.get("sync_direction", ""),
+                meta.get("content_hash", ""),
+            )
+        )
+    payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +203,7 @@ async def sync(
         prev = state.get(adapter_key, {})
 
         current_agent_fp = adapter.fingerprint()
-        all_memories = await backend.get_user_memories(user_id, limit=500)
+        all_memories = await backend.get_user_memories(user_id, limit=None)
         current_db_fp = _db_fingerprint(all_memories)
 
         if (
@@ -199,7 +216,7 @@ async def sync(
             )
             return result
     else:
-        all_memories = await backend.get_user_memories(user_id, limit=500)
+        all_memories = await backend.get_user_memories(user_id, limit=None)
 
     # --- Phase 1: Import (agent files → DB) ---
     result.imported = await sync_import(backend, adapter, user_id, all_memories)
@@ -207,7 +224,7 @@ async def sync(
     # --- Phase 2: Export (DB → agent files) ---
     # Re-fetch if imports happened (new entries)
     if result.imported > 0:
-        all_memories = await backend.get_user_memories(user_id, limit=500)
+        all_memories = await backend.get_user_memories(user_id, limit=None)
     result.exported = await sync_export(backend, adapter, user_id, all_memories)
 
     # --- Update sync state ---
@@ -243,7 +260,7 @@ async def sync_import(
 
     # Build set of existing content hashes for dedup
     if existing_memories is None:
-        existing_memories = await backend.get_user_memories(user_id, limit=500)
+        existing_memories = await backend.get_user_memories(user_id, limit=None)
 
     existing_hashes: set[str] = set()
     for mem in existing_memories:
@@ -288,7 +305,7 @@ async def sync_export(
 ) -> int:
     """Export: DB → agent files. Returns count exported."""
     if existing_memories is None:
-        existing_memories = await backend.get_user_memories(user_id, limit=500)
+        existing_memories = await backend.get_user_memories(user_id, limit=None)
 
     if not existing_memories:
         return 0
@@ -343,6 +360,21 @@ async def sync_export(
 # ---------------------------------------------------------------------------
 
 
+def _build_sync_backend(db_path: str) -> Any:
+    """Build the memory backend used by the sync subprocess.
+
+    Match the proxy MCP server (see ``headroom/memory/mcp_server.py``): use the
+    torch-free ONNX embedder so ``wrap --memory`` sync works on the proxy extras
+    without sentence-transformers/PyTorch (#1092). It loads the same
+    ``all-MiniLM-L6-v2`` 384-dim model as the local embedder, so vectors stay
+    compatible with what the proxy writes — no DB migration.
+    """
+    from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+
+    config = LocalBackendConfig(db_path=db_path, embedder_backend="onnx")
+    return LocalBackend(config)
+
+
 def main() -> None:
     """CLI entry point for running sync from a subprocess."""
     import argparse
@@ -358,10 +390,7 @@ def main() -> None:
     import json as _json
 
     async def _run() -> None:
-        from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
-
-        config = LocalBackendConfig(db_path=args.db)
-        backend = LocalBackend(config)
+        backend = _build_sync_backend(args.db)
         await backend._ensure_initialized()
 
         if args.agent == "claude":

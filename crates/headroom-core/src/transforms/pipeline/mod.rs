@@ -52,8 +52,10 @@
 //! Reformats:
 //! - [`reformats::JsonMinifier`] — JSON whitespace stripping.
 //! - [`reformats::LogTemplate`] — Drain-style template miner for
-//!   build/log output. Lossless — emits `[Template Tn: ...] (Nx)` +
-//!   variant table, every original line reconstructible.
+//!   build/log output. Tokens preserved, whitespace normalized —
+//!   emits `[Template Tn: ...] (Nx)` + variant table; the exact
+//!   original is recoverable only through CCR when an offload runs
+//!   after the reformat.
 //!
 //! Offloads:
 //! - [`offloads::JsonOffload`] — wraps `SmartCrusher` for JSON arrays
@@ -73,9 +75,6 @@
 //!   but is NOT in the default re-exports — modern agents use scoped
 //!   `rg`/`grep`, the marginal value didn't justify default registration.
 //!
-//! Deferred to later PRs:
-//! - **ProseFieldCompressor** — Phase 3g PR3. Compresses prose-shaped
-//!   string fields inside structured payloads.
 //!
 //! [`estimate_bloat`]: traits::OffloadTransform::estimate_bloat
 
@@ -87,14 +86,14 @@ pub mod traits;
 
 pub use config::{
     BloatConfigs, ConfigError, DiffBloatConfig, DiffNoiseConfig, JsonOffloadConfig, LogBloatConfig,
-    LogTemplateConfig, OffloadConfigs, OrchestratorConfig, PipelineConfig, ReformatConfigs,
-    SearchBloatConfig,
+    LogTemplateConfig, OffloadConfigs, OrchestratorConfig, PipelineConfig, ProseFieldConfig,
+    ReformatConfigs, SearchBloatConfig,
 };
 // `SearchOffload` is intentionally NOT in the top-level re-export
 // (deprecated from default pipeline; reach via the explicit module
 // path if you want to opt in). See `offloads::search_offload` head
 // docs for rationale.
-pub use offloads::{DiffNoise, DiffOffload, JsonOffload, LogOffload};
+pub use offloads::{DiffNoise, DiffOffload, JsonOffload, LogOffload, ProseFieldOffload};
 pub use orchestrator::{CompressionPipeline, CompressionPipelineBuilder, PipelineResult};
 pub use reformats::{JsonMinifier, LogTemplate};
 pub use traits::{

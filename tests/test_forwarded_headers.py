@@ -19,7 +19,9 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import Headers, State
 
 from headroom.proxy.forwarded_headers import (
+    TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV,
     TRUSTED_GATEWAY_CIDRS_ENV,
+    load_trusted_dashboard_client_cidrs,
     load_trusted_gateway_cidrs,
     peer_is_trusted_gateway,
     resolve_client_ip,
@@ -113,6 +115,36 @@ def test_load_cidrs_reads_env_by_default(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv(TRUSTED_GATEWAY_CIDRS_ENV, "10.0.0.0/8")
     cidrs = load_trusted_gateway_cidrs()
     assert [str(c) for c in cidrs] == ["10.0.0.0/8"]
+
+
+def test_load_dashboard_client_cidrs_uses_their_own_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV,
+        "100.90.0.5/32, fd7a:115c:a1e0::/48",
+    )
+
+    cidrs = load_trusted_dashboard_client_cidrs()
+
+    assert [str(cidr) for cidr in cidrs] == [
+        "100.90.0.5/32",
+        "fd7a:115c:a1e0::/48",
+    ]
+
+
+def test_load_dashboard_client_cidrs_unset_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV, raising=False)
+    assert load_trusted_dashboard_client_cidrs() == ()
+
+
+def test_load_dashboard_client_cidrs_empty_and_malformed_values() -> None:
+    assert load_trusted_dashboard_client_cidrs("") == ()
+    assert load_trusted_dashboard_client_cidrs("   ") == ()
+    with pytest.raises(ValueError, match=TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV):
+        load_trusted_dashboard_client_cidrs("100.90.0.5/32,not-a-cidr")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -310,8 +342,10 @@ def test_comma_whitespace_tolerance_in_env(
         assert resolve_client_ip(req) == "203.0.113.7", f"peer={peer}"
 
 
-def test_x_forwarded_for_takes_leftmost(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``X-Forwarded-For: client, p1, p2`` → leftmost is the origin."""
+def test_x_forwarded_for_skips_trusted_gateways_from_the_right(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``X-Forwarded-For: client, p1, p2`` → first untrusted hop from the right."""
     monkeypatch.setenv(TRUSTED_GATEWAY_CIDRS_ENV, "10.0.0.0/8")
     req = _fake_request(
         peer_host="10.0.0.5",
@@ -465,3 +499,41 @@ def test_integration_non_ip_peer_fails_gate(
     body = resp.json()
     assert body["client_ip"] == "testclient"
     assert body["forwarded"] == {"for": "", "proto": "", "host": ""}
+
+
+def test_client_written_x_forwarded_for_is_not_the_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An appending gateway keeps the client's own header on the left."""
+    monkeypatch.setenv(TRUSTED_GATEWAY_CIDRS_ENV, "10.0.0.0/8")
+    req = _fake_request(
+        peer_host="10.0.0.5",
+        forwarded_for="127.0.0.1, 203.0.113.9",  # client wrote 127.0.0.1; gateway added .9
+    )
+    assert resolve_client_ip(req) == "203.0.113.9"
+
+
+def test_x_forwarded_for_all_trusted_falls_back_to_leftmost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TRUSTED_GATEWAY_CIDRS_ENV, "10.0.0.0/8")
+    req = _fake_request(peer_host="10.0.0.5", forwarded_for="10.1.1.1, 10.0.0.99")
+    assert resolve_client_ip(req) == "10.1.1.1"
+
+
+@pytest.mark.parametrize(
+    ("forwarded_for", "expected"),
+    [
+        ("198.51.100.7, 10.0.0.99:50123", "198.51.100.7"),
+        ("198.51.100.7:4711, 10.0.0.99", "198.51.100.7"),
+        ("[2001:db8::7]:4711, 10.0.0.99:50123", "2001:db8::7"),
+        ("2001:db8::7, 10.0.0.99", "2001:db8::7"),
+    ],
+)
+def test_x_forwarded_for_hops_with_ports(
+    monkeypatch: pytest.MonkeyPatch, forwarded_for: str, expected: str
+) -> None:
+    """Gateways that append ``IP:port`` are still recognised and skipped."""
+    monkeypatch.setenv(TRUSTED_GATEWAY_CIDRS_ENV, "10.0.0.0/8")
+    req = _fake_request(peer_host="10.0.0.5", forwarded_for=forwarded_for)
+    assert resolve_client_ip(req) == expected
